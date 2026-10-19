@@ -137,6 +137,71 @@ export const openApiDocument = {
               },
             },
           },
+          recoveryCodes: {
+            type: "array",
+            items: { type: "string", example: "ABC23456789ABCDE" },
+            description:
+              "8 single-use backup codes. Present ONLY on the very first signup " +
+              "(issue #108) — never on later logins.",
+          },
+        },
+      },
+      RecoverBody: {
+        type: "object",
+        required: ["recoveryCode"],
+        properties: {
+          recoveryCode: {
+            type: "string",
+            minLength: 16,
+            maxLength: 16,
+            pattern: "^[A-Za-z0-9]{16}$",
+            description: "A single-use backup code issued at signup (issue #108).",
+            example: "ABC23456789ABCDE",
+          },
+        },
+      },
+      RecoveryTokenResponse: {
+        type: "object",
+        required: ["token", "message", "expiresIn"],
+        properties: {
+          token: {
+            type: "string",
+            description: "One-time JWT (15 min) scoped to recovery — present it to POST /api/v1/auth/recover/change-phone.",
+          },
+          message: { type: "string" },
+          expiresIn: { type: "string", example: "15m" },
+        },
+      },
+      ChangePhoneBody: {
+        type: "object",
+        required: ["token", "newPhone"],
+        properties: {
+          token: {
+            type: "string",
+            description: "The one-time recovery JWT from POST /api/v1/auth/recover.",
+          },
+          newPhone: {
+            type: "string",
+            description: "E.164 or Nigerian local format (0XXXXXXXXXX). 10–15 digits.",
+            example: "+2348098765432",
+          },
+        },
+      },
+      RecoveryStatusResponse: {
+        type: "object",
+        required: ["data"],
+        properties: {
+          data: {
+            type: "object",
+            required: ["remaining"],
+            properties: {
+              remaining: {
+                type: "integer",
+                description: "How many backup codes remain unused (issue #108).",
+                example: 8,
+              },
+            },
+          },
         },
       },
 
@@ -151,7 +216,6 @@ export const openApiDocument = {
         type: "object",
         required: [
           "id",
-          "seller_id",
           "asset_type",
           "amount",
           "status",
@@ -161,7 +225,22 @@ export const openApiDocument = {
         ],
         properties: {
           id: { type: "string", format: "uuid" },
-          seller_id: { type: "string", format: "uuid" },
+          seller_id: {
+            type: "string",
+            format: "uuid",
+            nullable: true,
+            description:
+              "Seller UUID. Present on detail/create responses but omitted " +
+              "from the public listing feed, which exposes `seller_handle` instead (issue #330).",
+          },
+          seller_handle: {
+            type: "string",
+            nullable: true,
+            example: "@airflex_2f9a",
+            description:
+              "Opaque, deterministic seller label derived from the user id. " +
+              "Included on the public listing feed instead of `seller_id` (issue #330).",
+          },
           buyer_id: {
             type: ["string", "null"],
             format: "uuid",
@@ -196,9 +275,16 @@ export const openApiDocument = {
             example: "MTN_AIRTIME",
           },
           amount: {
-            type: "number",
-            exclusiveMinimum: 0,
-            example: 500,
+            type: "integer",
+            minimum: 1,
+            maximum: 1_000_000_000_000,
+            example: 500_000_000,
+            description:
+              "Listing amount **in stroops** (the escrow contract's unit, " +
+              "1 NGN = 1,000,000 stroops). The client converts exactly once " +
+              "with `toStroops()` from `@airflex/shared`; the server validates " +
+              "a positive integer and forwards it to the contract unchanged " +
+              "(issue #292).",
           },
           expiresInHours: {
             type: "integer",
@@ -210,16 +296,48 @@ export const openApiDocument = {
       },
       BuyTradeBody: {
         type: "object",
-        required: ["buyerSecretKey"],
+        required: ["signedXdr"],
         properties: {
-          buyerSecretKey: {
+          signedXdr: {
             type: "string",
-            minLength: 56,
-            maxLength: 56,
             description:
-              "Stellar secret key (S...). 56 characters. " +
-              "NOTE: client-side XDR signing is preferred in production.",
-            example: "SXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+              "The escrow deposit envelope returned by " +
+              "`POST /api/v1/trades/{id}/buy/prepare`, signed by the buyer in " +
+              "their own browser. Base64 XDR. The buyer's secret key is never " +
+              "sent to this API.",
+            example: "AAAAAgAAAAD...",
+          },
+        },
+      },
+      DisputeBody: {
+        type: "object",
+        required: ["reason"],
+        properties: {
+          reason: {
+            type: "string",
+            minLength: 1,
+            maxLength: 500,
+            description: "Why the trade is being disputed.",
+            example: "Seller did not deliver the airtime after payment was locked.",
+          },
+        },
+      },
+      PrepareBuyResponse: {
+        type: "object",
+        required: ["xdr", "networkPassphrase", "publicKey"],
+        properties: {
+          xdr: {
+            type: "string",
+            description: "Unsigned, already-simulated transaction envelope (base64 XDR).",
+          },
+          networkPassphrase: {
+            type: "string",
+            description: "Network the envelope must be signed against.",
+            example: "Test SDF Network ; September 2015",
+          },
+          publicKey: {
+            type: "string",
+            description: "Buyer's Stellar account — the envelope's source account.",
           },
         },
       },
@@ -313,6 +431,15 @@ export const openApiDocument = {
               createdAt: { type: "string", format: "date-time" },
               totalTradesCompleted: { type: "integer", example: 5 },
               stellarPublicKey: { type: "string", example: "GABC1234..." },
+              kycStatus: {
+                type: "string",
+                enum: ["unverified", "pending", "verified", "rejected"],
+                example: "verified",
+              },
+              referralCode: {
+                type: "string",
+                example: "K7QM2XWTHN4PZR8C",
+              },
             },
           },
         },
@@ -391,6 +518,66 @@ export const openApiDocument = {
           queues: {
             type: "array",
             items: { $ref: "#/components/schemas/QueueStats" },
+          },
+        },
+      },
+      AnalyticsOverview: {
+        type: "object",
+        required: ["data"],
+        properties: {
+          data: {
+            type: "object",
+            required: [
+              "totalUsers",
+              "totalTrades",
+              "tradeVolume",
+              "feeRevenue",
+              "successRate",
+            ],
+            properties: {
+              totalUsers: { type: "integer", example: 1240 },
+              totalTrades: { type: "integer", example: 860 },
+              tradeVolume: { type: "number", example: 482500 },
+              feeRevenue: { type: "number", example: 9650 },
+              successRate: { type: "number", example: 87.5 },
+            },
+          },
+        },
+      },
+      AnalyticsTimeseriesPoint: {
+        type: "object",
+        required: ["date", "tradeCount", "volume"],
+        properties: {
+          date: { type: "string", format: "date", example: "2026-08-01" },
+          tradeCount: { type: "integer", example: 42 },
+          volume: { type: "number", example: 21000 },
+        },
+      },
+      AnalyticsTimeseriesResponse: {
+        type: "object",
+        required: ["data"],
+        properties: {
+          data: {
+            type: "array",
+            items: { $ref: "#/components/schemas/AnalyticsTimeseriesPoint" },
+          },
+        },
+      },
+      AnalyticsAssetsResponse: {
+        type: "object",
+        required: ["data"],
+        properties: {
+          data: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["assetType", "tradeCount", "volume"],
+              properties: {
+                assetType: { type: "string", example: "MTN_AIRTIME" },
+                tradeCount: { type: "integer", example: 310 },
+                volume: { type: "number", example: 155000 },
+              },
+            },
           },
         },
       },
@@ -619,6 +806,124 @@ export const openApiDocument = {
         },
       },
     },
+    "/api/v1/auth/recover": {
+      post: {
+        tags: ["Auth"],
+        summary: "Recover account with a backup code",
+        description:
+          "Redeems a single-use backup code (issue #108) and returns a short-lived " +
+          "one-time token that can be used to register a new phone number. " +
+          "5 failed attempts from the same IP within 1 hour trigger a 429 lockout.",
+        security: [],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/RecoverBody" },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Code accepted — one-time recovery token issued.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/RecoveryTokenResponse" },
+              },
+            },
+          },
+          "401": {
+            description: "Invalid or already-used recovery code.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "422": { $ref: "#/components/responses/UnprocessableEntity" },
+          "429": { $ref: "#/components/responses/TooManyRequests" },
+          "500": { $ref: "#/components/responses/InternalError" },
+        },
+      },
+    },
+    "/api/v1/auth/recover/change-phone": {
+      post: {
+        tags: ["Auth"],
+        summary: "Register a new phone number after recovery",
+        description:
+          "Presents the one-time recovery token from POST /api/v1/auth/recover " +
+          "and moves the account to a new phone number. Sends an OTP to the new phone " +
+          "number and prompts the user to verify ownership via POST /api/v1/auth/verify-otp " +
+          "before a session JWT is issued.",
+        security: [],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/ChangePhoneBody" },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Phone number updated — verification prompt returned.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    message: { type: "string" },
+                    phone: { type: "string" },
+                    requiresVerification: { type: "boolean" },
+                  },
+                },
+              },
+            },
+          },
+          "401": {
+            description: "Recovery token is invalid, expired, or not recovery-scoped.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "404": { $ref: "#/components/responses/NotFound" },
+          "409": {
+            description: "The new phone number is already registered to another account.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "422": { $ref: "#/components/responses/UnprocessableEntity" },
+          "500": { $ref: "#/components/responses/InternalError" },
+        },
+      },
+    },
+    "/api/v1/auth/recovery-codes/status": {
+      get: {
+        tags: ["Auth"],
+        summary: "Check remaining recovery codes",
+        description:
+          "Returns how many backup codes remain unused for the authenticated user " +
+          "(issue #108). The codes themselves are never revealed.",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "Remaining code count.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/RecoveryStatusResponse" },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "500": { $ref: "#/components/responses/InternalError" },
+        },
+      },
+    },
 
     // ------------------------------------------------------------------ Trades
     "/api/v1/trades": {
@@ -666,6 +971,15 @@ export const openApiDocument = {
           "Creates a new trade listing. Calls `create_listing` on the Soroban escrow contract " +
           "and stores the resulting on-chain listing ID.",
         security: [{ bearerAuth: [] }],
+        parameters: [
+          {
+            name: "Idempotency-Key",
+            in: "header",
+            required: false,
+            description: "Optional idempotency key to prevent duplicate listing creation on retry.",
+            schema: { type: "string" },
+          },
+        ],
         requestBody: {
           required: true,
           content: {
@@ -734,13 +1048,59 @@ export const openApiDocument = {
         },
       },
     },
+    "/api/v1/trades/{id}/buy/prepare": {
+      post: {
+        tags: ["Trades"],
+        summary: "Build the unsigned escrow deposit for a buy",
+        description:
+          "Returns the simulated but unsigned `deposit_to_escrow` envelope for the " +
+          "authenticated buyer to sign locally. Takes no request body. " +
+          "Sign the returned XDR client-side, then POST it to " +
+          "`/api/v1/trades/{id}/buy`.",
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          {
+            name: "id",
+            in: "path",
+            required: true,
+            schema: { type: "string", format: "uuid" },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Unsigned envelope ready for client-side signing.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: { $ref: "#/components/schemas/PrepareBuyResponse" },
+                  },
+                },
+              },
+            },
+          },
+          "400": {
+            description: "Trade not available, already locked, or buyer is the seller.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "404": { $ref: "#/components/responses/NotFound" },
+          "500": { $ref: "#/components/responses/InternalError" },
+        },
+      },
+    },
     "/api/v1/trades/{id}/buy": {
       post: {
         tags: ["Trades"],
-        summary: "Buy a trade offer",
+        summary: "Submit a signed escrow deposit for a trade",
         description:
-          "Locks the buyer's funds in the Soroban escrow contract via `deposit_to_escrow`. " +
-          "Trade status transitions to Locked.",
+          "Submits the buyer-signed `deposit_to_escrow` envelope from " +
+          "`/buy/prepare` to the network. Trade status transitions to Locked.",
         security: [{ bearerAuth: [] }],
         parameters: [
           {
@@ -830,6 +1190,77 @@ export const openApiDocument = {
           "401": { $ref: "#/components/responses/Unauthorized" },
           "403": { $ref: "#/components/responses/Forbidden" },
           "404": { $ref: "#/components/responses/NotFound" },
+          "500": { $ref: "#/components/responses/InternalError" },
+        },
+      },
+    },
+    "/api/v1/trades/{id}/dispute": {
+      post: {
+        tags: ["Trades"],
+        summary: "Dispute a locked trade",
+        description:
+          "Escalates a Locked trade to Disputed. Either the buyer or the seller " +
+          "of the trade may call this. An admin resolves the dispute via " +
+          "POST /api/v1/admin/trades/{id}/resolve.",
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          {
+            name: "id",
+            in: "path",
+            required: true,
+            schema: { type: "string", format: "uuid" },
+          },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/DisputeBody" },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Trade successfully disputed.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    message: { type: "string" },
+                    data: { $ref: "#/components/schemas/TradeOffer" },
+                  },
+                },
+              },
+            },
+          },
+          "400": {
+            description: "Trade is not in a state that can be disputed.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "403": {
+            description: "Caller is neither the buyer nor the seller of this trade.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "404": { $ref: "#/components/responses/NotFound" },
+          "409": {
+            description: "Trade is already disputed or is no longer Locked.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "422": { $ref: "#/components/responses/UnprocessableEntity" },
           "500": { $ref: "#/components/responses/InternalError" },
         },
       },
@@ -1143,13 +1574,40 @@ export const openApiDocument = {
     },
 
     // ------------------------------------------------------------------ Events
-    "/api/events": {
+    //
+    // eventsRouter is mounted at both /api/v1/events (current) and /api/events
+    // (legacy alias — see routes/index.ts). Both paths are documented here so
+    // the versioned endpoint clients are told to use isn't missing from the
+    // spec (issue: the SSE endpoint was undocumented under its /api/v1 path).
+    "/api/v1/events": {
       get: {
         tags: ["Events"],
         summary: "Server-Sent Events stream",
         description:
           "Persistent SSE connection for real-time trade status updates. " +
-          "Event types: `connected`, `trade_completed`, `trade_disputed`, `admin_alert`.",
+          "Event types: `connected`, `trade_completed`, `trade_disputed`, `admin_alert`. " +
+          "Also available, unversioned, at `/api/events` for backwards compatibility.",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "SSE stream opened.",
+            content: {
+              "text/event-stream": {
+                schema: { type: "string" },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+        },
+      },
+    },
+    "/api/events": {
+      get: {
+        tags: ["Events"],
+        summary: "Server-Sent Events stream (legacy alias)",
+        description:
+          "Unversioned alias for `/api/v1/events`, kept for backwards " +
+          "compatibility. Prefer `/api/v1/events` for new integrations.",
         security: [{ bearerAuth: [] }],
         responses: {
           "200": {
@@ -1180,6 +1638,105 @@ export const openApiDocument = {
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/QueuesResponse" },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "403": { $ref: "#/components/responses/Forbidden" },
+          "500": { $ref: "#/components/responses/InternalError" },
+        },
+      },
+    },
+    "/api/v1/admin/analytics/overview": {
+      get: {
+        tags: ["Admin"],
+        summary: "Platform analytics overview",
+        description:
+          "Platform-level metrics for the admin dashboard (issue #110): total users, " +
+          "total trades, completed trade volume, platform fee revenue, and success " +
+          "rate. Cached in Redis for 5 minutes.",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "Platform metrics.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/AnalyticsOverview" },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "403": { $ref: "#/components/responses/Forbidden" },
+          "500": { $ref: "#/components/responses/InternalError" },
+        },
+      },
+    },
+    "/api/v1/admin/analytics/trades/timeseries": {
+      get: {
+        tags: ["Admin"],
+        summary: "Daily trade volume timeseries",
+        description:
+          "Daily trade counts and volume for the range [?from, ?to] (issue #110). " +
+          "Both params are ISO-8601 dates; they default to the last 30 days. " +
+          "Cached in Redis for 5 minutes.",
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          {
+            name: "from",
+            in: "query",
+            schema: {
+              type: "string",
+              format: "date",
+              example: "2026-08-01",
+            },
+          },
+          {
+            name: "to",
+            in: "query",
+            schema: {
+              type: "string",
+              format: "date",
+              example: "2026-08-28",
+            },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Daily trade counts and volume.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/AnalyticsTimeseriesResponse" },
+              },
+            },
+          },
+          "400": {
+            description: "Invalid query parameters.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "403": { $ref: "#/components/responses/Forbidden" },
+          "500": { $ref: "#/components/responses/InternalError" },
+        },
+      },
+    },
+    "/api/v1/admin/analytics/assets": {
+      get: {
+        tags: ["Admin"],
+        summary: "Per-asset-type trade breakdown",
+        description:
+          "Trade counts and volume grouped by asset_type (issue #110), ordered by " +
+          "volume. Cached in Redis for 5 minutes.",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "Per-asset breakdown.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/AnalyticsAssetsResponse" },
               },
             },
           },

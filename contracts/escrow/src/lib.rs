@@ -1,8 +1,11 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
+
+extern crate alloc;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short,
-    token, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -15,7 +18,15 @@ pub enum DataKey {
     TradeCounter,
     Trade(u64),
     Paused,
+    PausedAt,
+    AllowedToken(Address),
+    TradeFillCounter(u64),
+    SubEscrow(u64, u64),
+    AllowedCategory(Symbol),
 }
+
+pub const EMERGENCY_TIMELOCK_SECS: u64 = 72 * 60 * 60; // 72 hours = 259,200 seconds
+pub const MAX_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60; // 30 days = 2,592,000 seconds
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,16 +44,16 @@ pub enum TradeStatus {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TradeOffer {
     pub id: u64,
     pub seller: Address,
-    pub token: Address,       // USDC or NGNC contract address
-    pub total_amount: i128,   // total token amount in stroops
-    pub filled_amount: i128,  // filled token amount in stroops
-    pub asset_type: Symbol,   // e.g. symbol_short!("AIRTIME")
+    pub token: Address,      // USDC or NGNC contract address
+    pub total_amount: i128,  // total token amount in stroops
+    pub filled_amount: i128, // filled token amount in stroops
+    pub asset_type: Symbol,  // e.g. symbol_short!("AIRTIME")
     pub status: TradeStatus,
-    pub expires_at: u64,      // Unix timestamp (ledger time)
+    pub expires_at: u64, // Unix timestamp (ledger time)
 }
 
 #[contracttype]
@@ -59,45 +70,140 @@ pub struct SubEscrow {
 // Errors
 // ---------------------------------------------------------------------------
 
-#[contracttype]
+/// Standardised contract error enum.
+///
+/// Discriminant values are stable — never change an existing value.
+/// New variants must always be appended at the end with the next integer.
+/// See `contracts/ERROR_CODES.md` for the full reference table.
+#[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContractError {
-    ContractPaused,
+    AlreadyInitialized = 1,
+    Unauthorized = 2,
+    TradeNotFound = 3,
+    WrongStatus = 4,
+    TradeExpired = 5,
+    InsufficientFunds = 6,
+    InvalidExpiry = 7,
+    AlreadyDisputed = 8,
+    ContractPaused = 9,
+    TimelockNotExpired = 10,
+    UnsupportedToken = 11,
+    InvalidAmount = 12,
+    FillAlreadyProcessed = 13,
+    NotAParty = 14,
+    PauseCooldownNotExpired = 15,
+    InvalidCategory      = 16,
+    DuplicateFill        = 17,
 }
 
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
-fn topic_created()   -> Symbol { symbol_short!("created")   }
-fn topic_locked()    -> Symbol { symbol_short!("locked")    }
-fn topic_completed() -> Symbol { symbol_short!("completed") }
-fn topic_cancelled() -> Symbol { symbol_short!("cancelled") }
-fn topic_disputed()  -> Symbol { symbol_short!("disputed")  }
-fn topic_contract()  -> Symbol { symbol_short!("contract")  }
-fn topic_paused()    -> Symbol { symbol_short!("paused")    }
-fn topic_unpaused()  -> Symbol { symbol_short!("unpaused")  }
+// Event topics defined with `symbol_short!` are limited to at most 9 ASCII
+// characters (e.g. "completed" and "cancelled" are exactly 9 chars, at the limit).
+// Any topic strings approaching or exceeding 9 characters must use `Symbol::new(env, "...")`
+// to avoid compile-time macro panics.
+fn topic_created() -> Symbol {
+    symbol_short!("created")
+} // 7 chars
+fn topic_locked() -> Symbol {
+    symbol_short!("locked")
+} // 6 chars
+fn topic_completed() -> Symbol {
+    symbol_short!("completed")
+} // 9 chars (max limit for symbol_short!)
+fn topic_cancelled() -> Symbol {
+    symbol_short!("cancelled")
+} // 9 chars (max limit for symbol_short!)
+fn topic_disputed() -> Symbol {
+    symbol_short!("disputed")
+} // 8 chars
+fn topic_contract() -> Symbol {
+    symbol_short!("contract")
+} // 8 chars
+fn topic_paused() -> Symbol {
+    symbol_short!("paused")
+} // 6 chars
+fn topic_unpaused() -> Symbol {
+    symbol_short!("unpaused")
+} // 8 chars
+fn topic_token() -> Symbol {
+    symbol_short!("token")
+} // 5 chars
+fn topic_allowed() -> Symbol {
+    symbol_short!("allowed")
+} // 7 chars
+fn topic_removed() -> Symbol {
+    symbol_short!("removed")
+} // 7 chars
+fn topic_released() -> Symbol {
+    symbol_short!("released")
+} // 8 chars
+fn topic_admin() -> Symbol {
+    symbol_short!("admin")
+} // 5 chars
+fn topic_transfer() -> Symbol {
+    symbol_short!("transfer")
+} // 8 chars
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn require_not_paused(env: &Env) {
+fn require_not_paused(env: &Env) -> Result<(), ContractError> {
     let paused: bool = env
         .storage()
         .instance()
         .get(&DataKey::Paused)
         .unwrap_or(false);
     if paused {
-        panic!("ContractPaused");
+        return Err(ContractError::ContractPaused);
     }
+    Ok(())
 }
 
-fn get_admin(env: &Env) -> Address {
+fn get_admin(env: &Env) -> Result<Address, ContractError> {
     env.storage()
         .instance()
         .get(&DataKey::Admin)
-        .expect("not initialised")
+        .ok_or(ContractError::Unauthorized)
+}
+
+const PAUSE_COOLDOWN_SECONDS: u64 = 300;
+
+/// Rejects a deposit from a buyer who already holds an *active* sub-escrow on
+/// this trade (issue #294).
+///
+/// Without this check a single buyer could call `deposit_to_escrow` repeatedly
+/// with small amounts — each one individually within the remaining capacity —
+/// and take over a listing that is meant to be shared by many buyers.
+///
+/// The rule is per `(trade, buyer)` and counts only *active* fills: a fill that
+/// has already been released or refunded no longer holds a place, so a buyer
+/// whose delivery completed (or whose funds were returned) can still buy into
+/// a listing that is only partially filled.
+fn require_no_active_fill(env: &Env, trade_id: u64, buyer: &Address) -> Result<(), ContractError> {
+    let fill_count: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TradeFillCounter(trade_id))
+        .unwrap_or(0);
+
+    for i in 1..=fill_count {
+        if let Some(sub_escrow) = env
+            .storage()
+            .persistent()
+            .get::<_, SubEscrow>(&DataKey::SubEscrow(trade_id, i))
+        {
+            if sub_escrow.buyer == *buyer && !sub_escrow.released && !sub_escrow.refunded {
+                return Err(ContractError::DuplicateFill);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -113,16 +219,38 @@ impl EscrowContract {
     // Initialise
     // -----------------------------------------------------------------------
 
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        allowed_tokens: Vec<Address>,
+    ) -> Result<(), ContractError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialised");
+            return Err(ContractError::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::TradeCounter, &0u64);
         env.storage().instance().set(&DataKey::Paused, &false);
+        // `PausedAt` doubles as "the moment we entered the paused state": 0
+        // means the contract has never been paused, so no cooldown applies.
+        env.storage().instance().set(&DataKey::PausedAt, &0u64);
+        for token in allowed_tokens.iter() {
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedToken(token.clone()), &true);
+        }
+        // Seed default asset categories
+        let airtime = Symbol::new(&env, "AIRTIME");
+        let data = Symbol::new(&env, "DATA");
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedCategory(airtime), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedCategory(data), &true);
         // Bump instance TTL so it survives long-running trades
         env.storage().instance().extend_ttl(17_280, 17_280 * 30);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -131,26 +259,50 @@ impl EscrowContract {
 
     /// Halts all state-mutating operations. Only callable by admin.
     /// Emits a `topics: ["contract", "paused"]` event.
-    pub fn pause(env: Env) {
-        let admin = get_admin(&env);
+    pub fn pause(env: Env) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
         admin.require_auth();
+
+        let is_already_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+
+        let now = env.ledger().timestamp();
+        if !is_already_paused {
+            env.storage().instance().set(&DataKey::PausedAt, &now);
+        }
 
         env.storage().instance().set(&DataKey::Paused, &true);
 
-        env.events()
-            .publish((topic_contract(), topic_paused()), ());
+        env.events().publish((topic_contract(), topic_paused()), ());
+        Ok(())
     }
 
     /// Resumes normal operations. Only callable by admin.
     /// Emits a `topics: ["contract", "unpaused"]` event.
-    pub fn unpause(env: Env) {
-        let admin = get_admin(&env);
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
         admin.require_auth();
 
+        let now = env.ledger().timestamp();
+        let last_pause_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedAt)
+            .unwrap_or(0);
+
+        if last_pause_at > 0 && now < last_pause_at.saturating_add(PAUSE_COOLDOWN_SECONDS) {
+            return Err(ContractError::PauseCooldownNotExpired);
+        }
+
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().remove(&DataKey::PausedAt);
 
         env.events()
             .publish((topic_contract(), topic_unpaused()), ());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -164,21 +316,33 @@ impl EscrowContract {
         amount: i128,
         asset_type: Symbol,
         expires_at: u64,
-    ) -> u64 {
-        require_not_paused(&env);
+    ) -> Result<u64, ContractError> {
         seller.require_auth();
+        require_not_paused(&env)?;
 
-        if !env.storage().instance().has(&DataKey::AllowedToken(token.clone())) {
-            return Err(Error::UnsupportedToken);
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
+            return Err(ContractError::UnsupportedToken);
+        }
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedCategory(asset_type.clone()))
+        {
+            return Err(ContractError::InvalidCategory);
         }
 
         if amount <= 0 {
-            panic!("amount must be positive");
+            return Err(ContractError::InvalidAmount);
         }
 
         let now = env.ledger().timestamp();
-        if expires_at <= now {
-            panic!("expires_at must be in the future");
+        if expires_at <= now || expires_at > now + MAX_EXPIRY_SECS {
+            return Err(ContractError::InvalidExpiry);
         }
 
         let id: u64 = env
@@ -201,9 +365,12 @@ impl EscrowContract {
         };
 
         env.storage().persistent().set(&DataKey::Trade(id), &trade);
-        env.storage().persistent().extend_ttl(&DataKey::Trade(id), 17_280, 17_280 * 30);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Trade(id), 17_280, 17_280 * 30);
 
-        env.events().publish((topic_created(), asset_type), (id, seller, amount));
+        env.events()
+            .publish((topic_created(), asset_type), (id, seller, amount));
 
         Ok(id)
     }
@@ -212,16 +379,75 @@ impl EscrowContract {
     // Admin functions
     // -----------------------------------------------------------------------
 
-    pub fn add_allowed_token(env: Env, token: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("not initialised");
+    /// Adds `token` to the set of tokens listings may be created/filled in.
+    /// Emits a `topics: ["token", "allowed"]` event carrying the token
+    /// address, so off-chain indexers and admin tooling can observe changes
+    /// to the allow-list without polling every token individually.
+    pub fn add_allowed_token(env: Env, token: Address) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
         admin.require_auth();
-        env.storage().instance().set(&DataKey::AllowedToken(token), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(token.clone()), &true);
+
+        env.events()
+            .publish((topic_token(), topic_allowed()), token);
+        Ok(())
     }
 
-    pub fn remove_allowed_token(env: Env, token: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("not initialised");
+    /// Removes `token` from the set of allowed tokens. Emits a
+    /// `topics: ["token", "removed"]` event carrying the token address —
+    /// previously this state change was silent on-chain.
+    pub fn remove_allowed_token(env: Env, token: Address) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
         admin.require_auth();
-        env.storage().instance().remove(&DataKey::AllowedToken(token));
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedToken(token.clone()));
+
+        env.events()
+            .publish((topic_token(), topic_removed()), token);
+        Ok(())
+    }
+
+    /// Adds `category` to the set of allowed asset category symbols.
+    /// Only callable by admin. Emits a `topics: ["category", "allowed"]` event.
+    pub fn add_category(env: Env, category: Symbol) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedCategory(category.clone()), &true);
+        env.events()
+            .publish((symbol_short!("category"), symbol_short!("allowed")), category);
+        Ok(())
+    }
+
+    /// Removes `category` from the set of allowed asset category symbols.
+    /// Only callable by admin. Emits a `topics: ["category", "removed"]` event.
+    pub fn remove_category(env: Env, category: Symbol) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedCategory(category.clone()));
+        env.events()
+            .publish((symbol_short!("category"), symbol_short!("removed")), category);
+        Ok(())
+    }
+
+    /// Transfers admin ownership to a new address.
+    /// Only callable by the current admin.
+    /// Emits a `topics: ["admin", "transfer"]` event with `(old_admin, new_admin)`.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events()
+            .publish((topic_admin(), topic_transfer()), (admin, new_admin));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -230,38 +456,63 @@ impl EscrowContract {
 
     /// Locks the buyer's funds into the contract for a specific trade.
     ///
-    /// Transfers `trade.amount` tokens from `buyer` → contract.
-    /// Sets trade status to `Locked`.
-    pub fn deposit_to_escrow(env: Env, buyer: Address, trade_id: u64) {
-        require_not_paused(&env);
+    /// Transfers `fill_amount` tokens from `buyer` → contract.
+    /// Sets trade status to `Locked` when fully filled, `PartiallyFilled` otherwise.
+    ///
+    /// At most one *active* sub-escrow per buyer per trade is allowed — a buyer
+    /// holding an unreleased/unrefunded fill on this trade is rejected with
+    /// `DuplicateFill` (issue #294), so no single buyer can fill a public
+    /// listing repeatedly and monopolise it.
+    pub fn deposit_to_escrow(
+        env: Env,
+        buyer: Address,
+        trade_id: u64,
+        fill_amount: i128,
+    ) -> Result<(), ContractError> {
         buyer.require_auth();
+        require_not_paused(&env)?;
 
         let mut trade: TradeOffer = env
             .storage()
             .persistent()
             .get(&DataKey::Trade(trade_id))
-            .expect("trade not found");
+            .ok_or(ContractError::TradeNotFound)?;
 
         if trade.status != TradeStatus::Open && trade.status != TradeStatus::PartiallyFilled {
-            panic!("trade is not open");
+            return Err(ContractError::WrongStatus);
         }
 
         let now = env.ledger().timestamp();
         if now >= trade.expires_at {
-            panic!("trade has expired");
+            return Err(ContractError::TradeExpired);
         }
 
         if buyer == trade.seller {
-            panic!("seller cannot buy own trade");
+            return Err(ContractError::Unauthorized);
+        }
+
+        // The admin address is the same key that later calls release_payment
+        // (the delivery oracle) and resolve_dispute/cancel_and_refund on this
+        // very trade. Letting it also act as the buyer would let one party
+        // control both sides of the trade plus its own arbitration — a
+        // conflict of interest with no legitimate use case here.
+        let admin = get_admin(&env)?;
+        if buyer == admin {
+            return Err(ContractError::Unauthorized);
         }
 
         if fill_amount <= 0 {
-            panic!("fill amount must be positive");
+            return Err(ContractError::InvalidAmount);
         }
 
         if fill_amount > trade.total_amount - trade.filled_amount {
-            panic!("fill amount exceeds available amount");
+            return Err(ContractError::InsufficientFunds);
         }
+
+        // One active sub-escrow per (trade, buyer) — issue #294. Checked before
+        // any funds move, so a rejected duplicate fill is a pure no-op on the
+        // trade's capacity and on the buyer's balance.
+        require_no_active_fill(&env, trade_id, &buyer)?;
 
         let token_client = token::Client::new(&env, &trade.token);
         token_client.transfer(&buyer, &env.current_contract_address(), &fill_amount);
@@ -273,10 +524,19 @@ impl EscrowContract {
             trade.status = TradeStatus::PartiallyFilled;
         }
 
-        env.storage().persistent().set(&DataKey::Trade(trade_id), &trade);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Trade(trade_id), &trade);
 
-        let fill_id = env.storage().instance().get(&DataKey::TradeFillCounter(trade_id)).unwrap_or(0u64) + 1;
-        env.storage().instance().set(&DataKey::TradeFillCounter(trade_id), &fill_id);
+        let fill_id = env
+            .storage()
+            .instance()
+            .get(&DataKey::TradeFillCounter(trade_id))
+            .unwrap_or(0u64)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::TradeFillCounter(trade_id), &fill_id);
 
         let sub_escrow = SubEscrow {
             fill_id,
@@ -285,9 +545,12 @@ impl EscrowContract {
             released: false,
             refunded: false,
         };
-        env.storage().persistent().set(&DataKey::SubEscrow(trade_id, fill_id), &sub_escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubEscrow(trade_id, fill_id), &sub_escrow);
 
         env.events().publish((topic_locked(),), (trade_id, buyer));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -296,23 +559,33 @@ impl EscrowContract {
 
     /// Releases escrowed funds to the seller once delivery is confirmed.
     ///
-    /// Only the admin account can call this to prevent premature release.
-    pub fn release_payment(env: Env, trade_id: u64) {
-        require_not_paused(&env);
+    /// The admin address (set at `initialize`) must authorise this call via
+    /// `require_auth()`. In production the admin is the platform server signing
+    /// key that verifies off-chain delivery before releasing escrow.
+    pub fn release_payment(env: Env, trade_id: u64, fill_id: u64) -> Result<(), ContractError> {
+        require_not_paused(&env)?;
 
-        let admin = get_admin(&env);
+        let admin = get_admin(&env)?;
         admin.require_auth();
 
-        let mut trade: TradeOffer = env.storage().persistent().get(&DataKey::Trade(trade_id)).expect("trade not found");
-        
+        let mut trade: TradeOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Trade(trade_id))
+            .ok_or(ContractError::TradeNotFound)?;
+
+        if trade.status != TradeStatus::Locked && trade.status != TradeStatus::PartiallyFilled {
+            return Err(ContractError::WrongStatus);
+        }
+
         let mut sub_escrow: SubEscrow = env
             .storage()
             .persistent()
             .get(&DataKey::SubEscrow(trade_id, fill_id))
-            .expect("fill not found");
+            .ok_or(ContractError::TradeNotFound)?;
 
         if sub_escrow.released || sub_escrow.refunded {
-            panic!("fill already processed");
+            return Err(ContractError::FillAlreadyProcessed);
         }
 
         let token_client = token::Client::new(&env, &trade.token);
@@ -323,13 +596,24 @@ impl EscrowContract {
         );
 
         sub_escrow.released = true;
-        env.storage().persistent().set(&DataKey::SubEscrow(trade_id, fill_id), &sub_escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubEscrow(trade_id, fill_id), &sub_escrow);
 
+        let mut completed = false;
         if trade.filled_amount == trade.total_amount {
-            let fill_count = env.storage().instance().get(&DataKey::TradeFillCounter(trade_id)).unwrap_or(0);
+            let fill_count = env
+                .storage()
+                .instance()
+                .get(&DataKey::TradeFillCounter(trade_id))
+                .unwrap_or(0);
             let mut all_released = true;
             for i in 1..=fill_count {
-                if let Some(sub) = env.storage().persistent().get::<_, SubEscrow>(&DataKey::SubEscrow(trade_id, i)) {
+                if let Some(sub) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, SubEscrow>(&DataKey::SubEscrow(trade_id, i))
+                {
                     if !sub.released && !sub.refunded {
                         all_released = false;
                         break;
@@ -338,43 +622,73 @@ impl EscrowContract {
             }
             if all_released {
                 trade.status = TradeStatus::Completed;
-                env.storage().persistent().set(&DataKey::Trade(trade_id), &trade);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Trade(trade_id), &trade);
+                completed = true;
             }
         }
 
-        env.events().publish((topic_completed(),), (trade_id, trade.seller.clone()));
+        env.events()
+            .publish((topic_released(),), (trade_id, fill_id, trade.seller.clone()));
+
+        if completed {
+            env.events()
+                .publish((topic_completed(),), (trade_id, trade.seller.clone()));
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // cancel_and_refund
     // -----------------------------------------------------------------------
 
-    pub fn cancel_and_refund(env: Env, caller: Address, trade_id: u64) {
-        require_not_paused(&env);
+    pub fn cancel_and_refund(
+        env: Env,
+        caller: Address,
+        trade_id: u64,
+    ) -> Result<(), ContractError> {
+        require_not_paused(&env)?;
         caller.require_auth();
 
-        let admin = get_admin(&env);
+        let admin = get_admin(&env)?;
+        let is_admin = caller == admin;
 
-        let mut trade: TradeOffer = env.storage().persistent().get(&DataKey::Trade(trade_id)).expect("trade not found");
+        let mut trade: TradeOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Trade(trade_id))
+            .ok_or(ContractError::TradeNotFound)?;
 
-        if trade.status != TradeStatus::Locked && trade.status != TradeStatus::Disputed && trade.status != TradeStatus::PartiallyFilled {
-            panic!("trade cannot be refunded in its current state");
+        if trade.status != TradeStatus::Locked
+            && trade.status != TradeStatus::Disputed
+            && trade.status != TradeStatus::PartiallyFilled
+        {
+            return Err(ContractError::WrongStatus);
         }
 
         let now = env.ledger().timestamp();
-        let fill_count = env.storage().instance().get(&DataKey::TradeFillCounter(trade_id)).unwrap_or(0);
+        let fill_count = env
+            .storage()
+            .instance()
+            .get(&DataKey::TradeFillCounter(trade_id))
+            .unwrap_or(0);
         let mut refunded_amount = 0;
         let mut caller_has_fills = false;
 
         let token_client = token::Client::new(&env, &trade.token);
 
         for i in 1..=fill_count {
-            if let Some(mut sub) = env.storage().persistent().get::<_, SubEscrow>(&DataKey::SubEscrow(trade_id, i)) {
+            if let Some(mut sub) = env
+                .storage()
+                .persistent()
+                .get::<_, SubEscrow>(&DataKey::SubEscrow(trade_id, i))
+            {
                 if !sub.released && !sub.refunded {
                     let is_buyer = sub.buyer == caller;
                     if is_admin || is_buyer {
                         if is_buyer && !is_admin && now < trade.expires_at {
-                            panic!("timelock has not expired yet");
+                            return Err(ContractError::TimelockNotExpired);
                         }
                         caller_has_fills = true;
                         token_client.transfer(
@@ -383,7 +697,9 @@ impl EscrowContract {
                             &sub.amount,
                         );
                         sub.refunded = true;
-                        env.storage().persistent().set(&DataKey::SubEscrow(trade_id, i), &sub);
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::SubEscrow(trade_id, i), &sub);
                         refunded_amount += sub.amount;
                     }
                 }
@@ -391,10 +707,20 @@ impl EscrowContract {
         }
 
         if !is_admin && !caller_has_fills {
-            panic!("only admin or buyer can cancel");
+            return Err(ContractError::Unauthorized);
         }
 
-        trade.filled_amount -= refunded_amount;
+        // `refunded_amount` is the sum of sub-escrow amounts we just walked and
+        // refunded above, so it should never exceed `filled_amount` — but a
+        // plain `-=` would either silently wrap (host panics are disabled) or
+        // abort the whole contract call on a host trap (this workspace builds
+        // with `overflow-checks = true`) if that invariant were ever violated
+        // by a future change. `checked_sub` turns that into an ordinary
+        // `Result::Err` the caller can handle instead of a low-level trap.
+        trade.filled_amount = trade
+            .filled_amount
+            .checked_sub(refunded_amount)
+            .ok_or(ContractError::InsufficientFunds)?;
 
         if is_admin {
             trade.status = TradeStatus::Cancelled;
@@ -404,30 +730,86 @@ impl EscrowContract {
             trade.status = TradeStatus::PartiallyFilled;
         }
 
-        env.storage().persistent().set(&DataKey::Trade(trade_id), &trade);
-        env.events().publish((topic_cancelled(),), (trade_id, caller));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Trade(trade_id), &trade);
+        env.events()
+            .publish((topic_cancelled(),), (trade_id, caller));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // close_expired_listing
+    // -----------------------------------------------------------------------
+
+    /// Removes an unfilled listing after its expiry so its persistent storage
+    /// can be reclaimed. Anyone may trigger this cleanup.
+    pub fn close_expired_listing(env: Env, trade_id: u64) -> Result<(), ContractError> {
+        let mut trade: TradeOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Trade(trade_id))
+            .ok_or(ContractError::TradeNotFound)?;
+
+        if trade.status != TradeStatus::Open {
+            return Err(ContractError::WrongStatus);
+        }
+
+        if env.ledger().timestamp() < trade.expires_at {
+            return Err(ContractError::TradeExpired);
+        }
+
+        trade.status = TradeStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Trade(trade_id), &trade);
+        env.storage().persistent().remove(&DataKey::Trade(trade_id));
+        env.events().publish((topic_cancelled(),), (trade_id,));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // flag_dispute
     // -----------------------------------------------------------------------
 
-    pub fn flag_dispute(env: Env, caller: Address, trade_id: u64) {
-        require_not_paused(&env);
+    /// Escalates a fully-filled (`Locked`) trade to `Disputed`.
+    ///
+    /// `PartiallyFilled` trades are rejected with `WrongStatus`: delivery is
+    /// only attempted once a trade is locked, so a buyer who deposited a
+    /// single stroop has no delivery grievance yet and must not be able to
+    /// freeze the seller's listing.
+    pub fn flag_dispute(env: Env, caller: Address, trade_id: u64) -> Result<(), ContractError> {
+        require_not_paused(&env)?;
         caller.require_auth();
 
-        let mut trade: TradeOffer = env.storage().persistent().get(&DataKey::Trade(trade_id)).expect("trade not found");
+        let mut trade: TradeOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Trade(trade_id))
+            .ok_or(ContractError::TradeNotFound)?;
 
-        if trade.status != TradeStatus::Locked && trade.status != TradeStatus::PartiallyFilled {
-            panic!("only a Locked or PartiallyFilled trade can be disputed");
+        if trade.status == TradeStatus::Disputed {
+            return Err(ContractError::AlreadyDisputed);
+        }
+
+        if trade.status != TradeStatus::Locked {
+            return Err(ContractError::WrongStatus);
         }
 
         let mut is_party = caller == trade.seller;
-        
+
         if !is_party {
-            let fill_count = env.storage().instance().get(&DataKey::TradeFillCounter(trade_id)).unwrap_or(0);
+            let fill_count = env
+                .storage()
+                .instance()
+                .get(&DataKey::TradeFillCounter(trade_id))
+                .unwrap_or(0);
             for i in 1..=fill_count {
-                if let Some(sub) = env.storage().persistent().get::<_, SubEscrow>(&DataKey::SubEscrow(trade_id, i)) {
+                if let Some(sub) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, SubEscrow>(&DataKey::SubEscrow(trade_id, i))
+                {
                     if sub.buyer == caller {
                         is_party = true;
                         break;
@@ -437,23 +819,101 @@ impl EscrowContract {
         }
 
         if !is_party {
-            panic!("only trade parties can flag a dispute");
+            return Err(ContractError::NotAParty);
         }
 
         trade.status = TradeStatus::Disputed;
-        env.storage().persistent().set(&DataKey::Trade(trade_id), &trade);
-        env.events().publish((topic_disputed(),), (trade_id, caller));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Trade(trade_id), &trade);
+        env.events()
+            .publish((topic_disputed(),), (trade_id, caller));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // emergency_withdraw — admin recovery for trapped funds (Issue #346)
+    // -----------------------------------------------------------------------
+
+    /// Recovers trapped funds in the event of a critical bug or settlement deadlock.
+    ///
+    /// Requirements:
+    /// - Callable only by the admin.
+    /// - Contract must be currently paused.
+    /// - A 72-hour timelock must have elapsed since the contract was paused.
+    /// - Emits a high-severity `emergency_withdrawal` event.
+    pub fn emergency_withdraw(
+        env: Env,
+        token: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        let is_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+
+        if !is_paused {
+            return Err(ContractError::WrongStatus);
+        }
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let paused_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedAt)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+        if now < paused_at + EMERGENCY_TIMELOCK_SECS {
+            return Err(ContractError::TimelockNotExpired);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance < amount {
+            return Err(ContractError::InsufficientFunds);
+        }
+
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_withdrawal"),),
+            (token, recipient, amount),
+        );
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // View helpers  (NOT blocked by paused flag)
     // -----------------------------------------------------------------------
 
-    pub fn get_trade(env: Env, trade_id: u64) -> TradeOffer {
-        env.storage()
+    pub fn get_trade(env: Env, trade_id: u64) -> Result<TradeOffer, ContractError> {
+        let trade: TradeOffer = env
+            .storage()
             .persistent()
             .get(&DataKey::Trade(trade_id))
-            .expect("trade not found")
+            .ok_or(ContractError::TradeNotFound)?;
+
+        // Reading an entry does not by itself keep it alive: extend the TTL on
+        // every read, not just on write (as create_listing already does).
+        // Without this, a trade that is read frequently but written rarely
+        // (e.g. repeatedly polled while Locked, waiting on off-chain delivery)
+        // can still be evicted between the read here and a later write, since
+        // the two are not atomic from the caller's perspective (TOCTOU).
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Trade(trade_id), 17_280, 17_280 * 30);
+
+        Ok(trade)
     }
 
     pub fn trade_count(env: Env) -> u64 {
@@ -463,11 +923,11 @@ impl EscrowContract {
             .unwrap_or(0u64)
     }
 
-    pub fn get_admin(env: Env) -> Address {
+    pub fn get_admin(env: Env) -> Result<Address, ContractError> {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
-            .expect("not initialised")
+            .ok_or(ContractError::Unauthorized)
     }
 
     /// Returns whether the contract is currently paused.
@@ -487,16 +947,23 @@ impl EscrowContract {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env,
+        vec, Address, Env, IntoVal,
     };
 
-    fn setup() -> (Env, EscrowContractClient<'static>, Address, Address, Address, Address) {
+    fn setup() -> (
+        Env,
+        EscrowContractClient<'static>,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
 
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -508,7 +975,7 @@ mod test {
         let token_address = token_id.address();
         let sac = StellarAssetClient::new(&env, &token_address);
 
-        sac.mint(&buyer, &10_000_0000000i128);
+        sac.mint(&buyer, &100_000_000_000i128);
 
         let allowed_tokens = vec![&env, token_address.clone()];
         client.initialize(&admin, &allowed_tokens);
@@ -517,13 +984,12 @@ mod test {
     }
 
     // -----------------------------------------------------------------------
-    // Existing functional tests
+    // Existing functional tests (updated to use Result-returning functions)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_create_listing() {
         let (env, client, _admin, seller, _buyer, token) = setup();
-
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
         let trade_id = client.create_listing(
@@ -532,6 +998,67 @@ mod test {
             &500_0000000i128,
             &symbol_short!("AIRTIME"),
             &(1_000_000 + 86_400),
+        );
+
+        assert_eq!(trade_id, 1);
+        let trade = client.get_trade(&trade_id);
+        assert_eq!(trade.status, TradeStatus::Open);
+        assert_eq!(trade.seller, seller);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+    fn test_create_listing_unauthorised_seller_rejected() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let expires_at = 1_000_000u64 + 86_400;
+
+        // `set_auths(&[])` turns off the auth mocking `setup()` enabled, so the
+        // seller's `require_auth()` runs for real and has to fail.
+        env.set_auths(&[]);
+
+        client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &expires_at,
+        );
+    }
+
+    #[test]
+    fn test_create_listing_authorised_seller_succeeds() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let expires_at = 1_000_000u64 + 86_400;
+
+        // Only the seller's signature is mocked, so the listing can only be
+        // created if that auth satisfies `seller.require_auth()`.
+        env.mock_auths(&[MockAuth {
+            address: &seller,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "create_listing",
+                args: (
+                    &seller,
+                    &token,
+                    &500_0000000i128,
+                    &symbol_short!("AIRTIME"),
+                    &expires_at,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &expires_at,
         );
 
         assert_eq!(trade_id, 1);
@@ -552,6 +1079,63 @@ mod test {
             &symbol_short!("AIRTIME"),
             &(1_000_000 + 86_400),
         );
+
+        client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+
+        let trade = client.get_trade(&trade_id);
+        assert_eq!(trade.status, TradeStatus::Locked);
+        assert_eq!(trade.filled_amount, 500_0000000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+    fn test_deposit_to_escrow_unauthorised_buyer_rejected() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+
+        // No auth is provided, so the buyer's `require_auth()` cannot pass.
+        env.set_auths(&[]);
+
+        client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+    }
+
+    #[test]
+    fn test_deposit_to_escrow_authorised_buyer_succeeds() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+
+        // Only the buyer's signature is mocked, so the deposit can only land if
+        // that auth covers both the root call and the token transfer it nests.
+        env.mock_auths(&[MockAuth {
+            address: &buyer,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "deposit_to_escrow",
+                args: (&buyer, &trade_id, &500_0000000i128).into_val(&env),
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &token,
+                    fn_name: "transfer",
+                    args: (&buyer, &client.address, &500_0000000i128).into_val(&env),
+                    sub_invokes: &[],
+                }],
+            },
+        }]);
 
         client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
 
@@ -594,7 +1178,7 @@ mod test {
         );
 
         client.deposit_to_escrow(&buyer, &trade_id, &200_0000000i128);
-        
+
         let buyer2 = Address::generate(&env);
         let sac = StellarAssetClient::new(&env, &token);
         sac.mint(&buyer2, &500_0000000i128);
@@ -606,9 +1190,15 @@ mod test {
         assert_eq!(trade.filled_amount, 500_0000000i128);
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #294 — one active sub-escrow per (trade, buyer)
+    // -----------------------------------------------------------------------
+
+    /// A buyer cannot stack a second active fill on the same listing: the
+    /// monopolising pattern from the issue (repeated deposits that each fit the
+    /// remaining capacity) is rejected with `DuplicateFill`.
     #[test]
-    #[should_panic(expected = "fill amount exceeds available amount")]
-    fn test_over_fill_rejection() {
+    fn test_deposit_to_escrow_rejects_duplicate_fill_by_same_buyer() {
         let (env, client, _admin, seller, buyer, token) = setup();
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
@@ -620,7 +1210,111 @@ mod test {
             &(1_000_000 + 86_400),
         );
 
-        client.deposit_to_escrow(&buyer, &trade_id, &600_0000000i128);
+        client.deposit_to_escrow(&buyer, &trade_id, &100_0000000i128);
+
+        // Second and third fills by the same buyer while the first is active.
+        let result = client.try_deposit_to_escrow(&buyer, &trade_id, &100_0000000i128);
+        assert_eq!(result, Err(Ok(ContractError::DuplicateFill)));
+
+        let result = client.try_deposit_to_escrow(&buyer, &trade_id, &400_0000000i128);
+        assert_eq!(result, Err(Ok(ContractError::DuplicateFill)));
+
+        // The rejected attempts moved no money and consumed no capacity, so the
+        // remainder of the listing stays available to other buyers.
+        let trade = client.get_trade(&trade_id);
+        assert_eq!(trade.status, TradeStatus::PartiallyFilled);
+        assert_eq!(trade.filled_amount, 100_0000000i128);
+
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(
+            token_client.balance(&buyer),
+            100_000_000_000i128 - 100_0000000i128
+        );
+    }
+
+    /// The limit is per buyer, not per trade: several buyers can still split a
+    /// listing, and the trade only locks once the capacity is exhausted.
+    #[test]
+    fn test_deposit_to_escrow_multi_buyer_partial_fills() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+
+        let sac = StellarAssetClient::new(&env, &token);
+        let buyer2 = Address::generate(&env);
+        let buyer3 = Address::generate(&env);
+        sac.mint(&buyer2, &200_0000000i128);
+        sac.mint(&buyer3, &200_0000000i128);
+
+        client.deposit_to_escrow(&buyer, &trade_id, &200_0000000i128);
+        client.deposit_to_escrow(&buyer2, &trade_id, &200_0000000i128);
+
+        let trade = client.get_trade(&trade_id);
+        assert_eq!(trade.status, TradeStatus::PartiallyFilled);
+        assert_eq!(trade.filled_amount, 400_0000000i128);
+
+        client.deposit_to_escrow(&buyer3, &trade_id, &100_0000000i128);
+
+        let trade = client.get_trade(&trade_id);
+        assert_eq!(trade.status, TradeStatus::Locked);
+        assert_eq!(trade.filled_amount, 500_0000000i128);
+
+        // Each buyer deposited exactly once, so all three fills are distinct
+        // and independently releasable.
+        client.release_payment(&trade_id, &1);
+        client.release_payment(&trade_id, &2);
+        client.release_payment(&trade_id, &3);
+
+        assert_eq!(client.get_trade(&trade_id).status, TradeStatus::Completed);
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(token_client.balance(&seller), 500_0000000i128);
+    }
+
+    /// "Active" is the rule, not "has ever deposited": once a buyer's fill has
+    /// been settled they may buy into the same (still partially filled)
+    /// listing again, which opens a new sub-escrow with a new fill id.
+    #[test]
+    fn test_deposit_to_escrow_allows_refill_after_release() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("DATA"),
+            &(1_000_000 + 86_400),
+        );
+
+        client.deposit_to_escrow(&buyer, &trade_id, &200_0000000i128);
+        // Fill #1 is delivered and settled while the listing is still open.
+        client.release_payment(&trade_id, &1);
+
+        let trade = client.get_trade(&trade_id);
+        assert_eq!(trade.status, TradeStatus::PartiallyFilled);
+        assert_eq!(trade.filled_amount, 200_0000000i128);
+
+        // The buyer holds no active fill any more, so a second deposit is
+        // accepted rather than rejected as a duplicate.
+        client.deposit_to_escrow(&buyer, &trade_id, &300_0000000i128);
+
+        let trade = client.get_trade(&trade_id);
+        assert_eq!(trade.status, TradeStatus::Locked);
+        assert_eq!(trade.filled_amount, 500_0000000i128);
+
+        // The settled fill stays settled: only the new fill #2 is releasable.
+        let result = client.try_release_payment(&trade_id, &1);
+        assert_eq!(result, Err(Ok(ContractError::FillAlreadyProcessed)));
+
+        client.release_payment(&trade_id, &2);
+        assert_eq!(client.get_trade(&trade_id).status, TradeStatus::Completed);
     }
 
     #[test]
@@ -668,12 +1362,316 @@ mod test {
         assert_eq!(trade.filled_amount, 0);
 
         let token_client = TokenClient::new(&env, &token);
-        assert_eq!(token_client.balance(&buyer), 10_000_0000000i128);
+        assert_eq!(token_client.balance(&buyer), 100_000_000_000i128);
     }
 
     #[test]
-    #[should_panic(expected = "timelock has not expired yet")]
-    fn test_cancel_before_expiry_fails() {
+    fn test_admin_cancels_immediately() {
+        let (env, client, admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+
+        client.cancel_and_refund(&admin, &trade_id);
+
+        let trade = client.get_trade(&trade_id);
+        assert_eq!(trade.status, TradeStatus::Cancelled);
+        assert_eq!(trade.filled_amount, 0);
+
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(token_client.balance(&buyer), 100_000_000_000i128);
+    }
+
+    #[test]
+    fn test_close_expired_open_listing_removes_storage() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000 + 86_400);
+        client.close_expired_listing(&trade_id);
+
+        assert_eq!(
+            client.try_get_trade(&trade_id),
+            Err(Ok(ContractError::TradeNotFound))
+        );
+    }
+
+    #[test]
+    fn test_close_expired_listing_rejects_unexpired_listing() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+
+        let result = client.try_close_expired_listing(&trade_id);
+
+        assert_eq!(result, Err(Ok(ContractError::TradeExpired)));
+        assert_eq!(client.get_trade(&trade_id).status, TradeStatus::Open);
+    }
+
+    #[test]
+    fn test_close_expired_listing_rejects_filled_listing() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000 + 86_400);
+
+        let result = client.try_close_expired_listing(&trade_id);
+
+        assert_eq!(result, Err(Ok(ContractError::WrongStatus)));
+        assert_eq!(client.get_trade(&trade_id).status, TradeStatus::Locked);
+    }
+
+    // -----------------------------------------------------------------------
+    // Error variant tests — assert typed ContractError is returned
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_err_already_initialized() {
+        let (env, client, admin, _seller, _buyer, token) = setup();
+        // setup() already called initialize; call it again
+        let allowed = vec![&env, token.clone()];
+        let result = client.try_initialize(&admin, &allowed);
+        assert_eq!(result, Err(Ok(ContractError::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_err_trade_not_found() {
+        let (_env, client, _admin, _seller, _buyer, _token) = setup();
+        let result = client.try_get_trade(&999u64);
+        assert_eq!(result, Err(Ok(ContractError::TradeNotFound)));
+    }
+
+    #[test]
+    fn test_err_unsupported_token() {
+        let (env, client, _admin, seller, _buyer, _token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        // Generate an address that was never added to the allowed list
+        let bad_token = Address::generate(&env);
+        let result = client.try_create_listing(
+            &seller,
+            &bad_token,
+            &100_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        assert_eq!(result, Err(Ok(ContractError::UnsupportedToken)));
+    }
+
+    #[test]
+    fn test_err_invalid_amount_zero() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        let result = client.try_create_listing(
+            &seller,
+            &token,
+            &0i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        assert_eq!(result, Err(Ok(ContractError::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_err_invalid_expiry() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        // expires_at in the past
+        let result = client.try_create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &999_999u64,
+        );
+        assert_eq!(result, Err(Ok(ContractError::InvalidExpiry)));
+    }
+
+    #[test]
+    fn test_err_wrong_status_deposit_on_completed_trade() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("DATA"),
+            &(1_000_000 + 86_400),
+        );
+        client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+        client.release_payment(&trade_id, &1);
+        // trade is now Completed — depositing again should fail
+        let buyer2 = Address::generate(&env);
+        let sac = StellarAssetClient::new(&env, &token);
+        sac.mint(&buyer2, &500_0000000i128);
+        let result = client.try_deposit_to_escrow(&buyer2, &trade_id, &100_0000000i128);
+        assert_eq!(result, Err(Ok(ContractError::WrongStatus)));
+    }
+
+    #[test]
+    fn test_err_trade_expired() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        // Advance time past expiry
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000 + 86_401);
+
+        let result = client.try_deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+        assert_eq!(result, Err(Ok(ContractError::TradeExpired)));
+    }
+
+    #[test]
+    fn test_err_insufficient_funds_overfill() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+
+        let result = client.try_deposit_to_escrow(&buyer, &trade_id, &600_0000000i128);
+        assert_eq!(result, Err(Ok(ContractError::InsufficientFunds)));
+    }
+
+    #[test]
+    fn test_err_wrong_status_release_on_open_trade() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        // No deposit — trade is still Open
+        let result = client.try_release_payment(&trade_id, &1);
+        assert_eq!(result, Err(Ok(ContractError::WrongStatus)));
+    }
+
+    #[test]
+    fn test_err_fill_already_processed() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("DATA"),
+            &(1_000_000 + 86_400),
+        );
+        // A *partial* fill keeps the trade out of its terminal state once the
+        // fill settles, which is what makes a second release reach the
+        // already-processed guard instead of the terminal-state check.
+        client.deposit_to_escrow(&buyer, &trade_id, &200_0000000i128);
+        // Release fill #1 once
+        client.release_payment(&trade_id, &1);
+        // Release same fill again — should fail
+        let result = client.try_release_payment(&trade_id, &1);
+        assert_eq!(result, Err(Ok(ContractError::FillAlreadyProcessed)));
+    }
+
+    #[test]
+    fn test_err_timelock_not_expired() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+        // Buyer tries to cancel before expiry
+        let result = client.try_cancel_and_refund(&buyer, &trade_id);
+        assert_eq!(result, Err(Ok(ContractError::TimelockNotExpired)));
+    }
+
+    #[test]
+    fn test_err_unauthorized_seller_cancel() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+        // Seller is not a buyer and not admin — should get Unauthorized
+        let result = client.try_cancel_and_refund(&seller, &trade_id);
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_err_already_disputed() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
+        // First flag
+        client.flag_dispute(&seller, &trade_id);
+        // Second flag on already-Disputed trade
+        let result = client.try_flag_dispute(&buyer, &trade_id);
+        assert_eq!(result, Err(Ok(ContractError::AlreadyDisputed)));
+    }
+
+    #[test]
+    fn test_err_not_a_party() {
         let (env, client, _admin, seller, buyer, token) = setup();
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
@@ -686,68 +1684,292 @@ mod test {
         );
         client.deposit_to_escrow(&buyer, &trade_id, &500_0000000i128);
 
-        client.cancel_and_refund(&buyer, &trade_id);
-    }
-
-    // -----------------------------------------------------------------------
-    // Pausability tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pause_and_unpause() {
-        let (_env, client, _admin, _seller, _buyer, _token) = setup();
-
-        // Initially not paused
-        assert!(!client.is_paused());
-
-        // Pause
-        client.pause();
-        assert!(client.is_paused());
-
-        // Unpause
-        client.unpause();
-        assert!(!client.is_paused());
+        let stranger = Address::generate(&env);
+        let result = client.try_flag_dispute(&stranger, &trade_id);
+        assert_eq!(result, Err(Ok(ContractError::NotAParty)));
     }
 
     #[test]
-    #[should_panic(expected = "ContractPaused")]
-    fn test_create_listing_blocked_when_paused() {
+    fn test_err_contract_paused() {
         let (env, client, _admin, seller, _buyer, token) = setup();
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
         client.pause();
 
-        client.create_listing(
+        let result = client.try_create_listing(
             &seller,
             &token,
             &500_0000000i128,
             &symbol_short!("AIRTIME"),
             &(1_000_000 + 86_400),
         );
+        assert_eq!(result, Err(Ok(ContractError::ContractPaused)));
     }
 
     #[test]
-    #[should_panic(expected = "ContractPaused")]
-    fn test_deposit_to_escrow_blocked_when_paused() {
-        let (env, client, _admin, seller, buyer, token) = setup();
+    fn test_err_unpause_requires_pause_cooldown() {
+        let (env, client, _admin, _seller, _buyer, _token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        client.pause();
+
+        let result = client.try_unpause();
+        assert_eq!(result, Err(Ok(ContractError::PauseCooldownNotExpired)));
+    }
+
+    #[test]
+    fn test_unpause_after_cooldown_succeeds() {
+        let (env, client, _admin, _seller, _buyer, _token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        client.pause();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000 + 301);
+
+        client.unpause();
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_err_unauthorized_get_admin_uninitialised() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        // Contract not initialised — get_admin should return Unauthorized
+        let result = client.try_get_admin();
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_event_topic_lengths_and_long_topic_handling() {
+        let env = Env::default();
+
+        // Compile-time & runtime verification that symbol_short! topics stay within <= 9 chars
+        const SHORT_TOPICS: &[&str] = &[
+            "created",
+            "locked",
+            "completed",
+            "cancelled",
+            "disputed",
+            "contract",
+            "paused",
+            "unpaused",
+            "token",
+            "allowed",
+            "removed",
+            "category",
+            "released",
+            "admin",
+            "transfer",
+        ];
+
+        for topic in SHORT_TOPICS {
+            assert!(
+                topic.len() <= 9,
+                "symbol_short! topic '{topic}' exceeds 9 characters"
+            );
+        }
+
+        // Test topic functions
+        let _ = topic_created();
+        let _ = topic_locked();
+        let _ = topic_completed();
+        let _ = topic_cancelled();
+        let _ = topic_disputed();
+        let _ = topic_contract();
+        let _ = topic_paused();
+        let _ = topic_unpaused();
+        let _ = topic_token();
+        let _ = topic_allowed();
+        let _ = topic_removed();
+        let _ = topic_released();
+        let _ = topic_admin();
+        let _ = topic_transfer();
+
+        // Verify that longer/new topics (> 9 chars, e.g. "emergency_withdrawal") work with Symbol::new(&env, ...)
+        let long_topic = Symbol::new(&env, "emergency_withdrawal");
+        assert_eq!(long_topic, Symbol::new(&env, "emergency_withdrawal"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Category validation tests
+    // -----------------------------------------------------------------------
+
+    /// Default categories (AIRTIME, DATA) seeded at initialize are accepted.
+    #[test]
+    fn test_default_categories_accepted() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
         let trade_id = client.create_listing(
             &seller,
             &token,
-            &500_0000000i128,
+            &100_0000000i128,
             &symbol_short!("AIRTIME"),
             &(1_000_000 + 86_400),
         );
+        assert_eq!(trade_id, 1);
 
-        client.pause();
+        let trade_id2 = client.create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("DATA"),
+            &(1_000_000 + 86_400),
+        );
+        assert_eq!(trade_id2, 2);
+    }
 
-        client.deposit_to_escrow(&buyer, &trade_id);
+    /// An unknown category symbol is rejected with InvalidCategory.
+    #[test]
+    fn test_err_invalid_category_unknown_symbol() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let result = client.try_create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("GIFT"),
+            &(1_000_000 + 86_400),
+        );
+        assert_eq!(result, Err(Ok(ContractError::InvalidCategory)));
+    }
+
+    /// Admin can add a new category; listings using it are then accepted.
+    #[test]
+    fn test_admin_add_category_then_listing_succeeds() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        // "ELEC" (electricity voucher) is not seeded by default — should fail first.
+        let result_before = client.try_create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("ELEC"),
+            &(1_000_000 + 86_400),
+        );
+        assert_eq!(result_before, Err(Ok(ContractError::InvalidCategory)));
+
+        // Admin adds the category.
+        client.add_category(&symbol_short!("ELEC"));
+
+        // Now the listing should succeed.
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("ELEC"),
+            &(1_000_000 + 86_400),
+        );
+        assert_eq!(trade_id, 1);
+        assert_eq!(client.get_trade(&trade_id).asset_type, symbol_short!("ELEC"));
+    }
+
+    /// Admin can remove a category; listings using it are then rejected.
+    #[test]
+    fn test_admin_remove_category_then_listing_fails() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        // AIRTIME is seeded by default — listing works before removal.
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        assert_eq!(trade_id, 1);
+
+        // Admin removes AIRTIME from allowed categories.
+        client.remove_category(&symbol_short!("AIRTIME"));
+
+        // Subsequent listing with AIRTIME should now fail.
+        let result = client.try_create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        assert_eq!(result, Err(Ok(ContractError::InvalidCategory)));
+    }
+
+    /// Non-admin cannot call add_category.
+    #[test]
+    #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+    fn test_err_non_admin_cannot_add_category() {
+        let (env, client, _admin, _seller, _buyer, _token) = setup();
+
+        env.set_auths(&[]);
+        client.add_category(&symbol_short!("GIFT"));
+    }
+
+    /// Non-admin cannot call remove_category.
+    #[test]
+    #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+    fn test_err_non_admin_cannot_remove_category() {
+        let (env, client, _admin, _seller, _buyer, _token) = setup();
+
+        env.set_auths(&[]);
+        client.remove_category(&symbol_short!("DATA"));
     }
 
     #[test]
-    #[should_panic(expected = "ContractPaused")]
-    fn test_release_payment_blocked_when_paused() {
+    fn test_create_listing_max_expiry_window() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        let now = 1_000_000u64;
+        env.ledger().with_mut(|l| l.timestamp = now);
+
+        // Exceeds max expiry window
+        let result = client.try_create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(now + MAX_EXPIRY_SECS + 1),
+        );
+        assert_eq!(result, Err(Ok(ContractError::InvalidExpiry)));
+
+        // At exact max expiry window -> succeeds
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &100_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(now + MAX_EXPIRY_SECS),
+        );
+        assert_eq!(trade_id, 1);
+    }
+
+    #[test]
+    fn test_transfer_admin_authorized_and_functional() {
+        let (env, client, admin, _seller, _buyer, _token) = setup();
+        assert_eq!(client.get_admin(), admin);
+
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+
+        // Verify new admin can perform admin-only operation (pause)
+        client.pause();
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+    fn test_err_transfer_admin_unauthorized() {
+        let (env, client, _admin, _seller, _buyer, _token) = setup();
+        let new_admin = Address::generate(&env);
+
+        env.set_auths(&[]);
+        client.transfer_admin(&new_admin);
+    }
+
+    #[test]
+    fn test_release_payment_event_topics_partial_and_completed() {
         let (env, client, _admin, seller, buyer, token) = setup();
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
@@ -758,119 +1980,363 @@ mod test {
             &symbol_short!("DATA"),
             &(1_000_000 + 86_400),
         );
-        client.deposit_to_escrow(&buyer, &trade_id);
 
-        client.pause();
+        // First deposit: partial fill (200 out of 500)
+        client.deposit_to_escrow(&buyer, &trade_id, &200_0000000i128);
 
-        client.release_payment(&trade_id);
+        // Release first fill
+        client.release_payment(&trade_id, &1);
+
+        // Check events after partial release: topic "released" is present, but "completed" is NOT
+        let all_events = env.events().all();
+        let released_symbol = symbol_short!("released");
+        let completed_symbol = symbol_short!("completed");
+
+        let has_released = all_events.iter().any(|e| {
+            e.1.iter().any(|t| t == released_symbol.to_val())
+        });
+        let has_completed = all_events.iter().any(|e| {
+            e.1.iter().any(|t| t == completed_symbol.to_val())
+        });
+
+        assert!(has_released, "Event topic 'released' should be published");
+        assert!(!has_completed, "Event topic 'completed' should NOT be published on partial release");
+
+        // Second deposit: completes remaining 300
+        client.deposit_to_escrow(&buyer, &trade_id, &300_0000000i128);
+        client.release_payment(&trade_id, &2);
+
+        // Check events after final release: now "completed" MUST be present
+        let all_events_after = env.events().all();
+        let has_completed_final = all_events_after.iter().any(|e| {
+            e.1.iter().any(|t| t == completed_symbol.to_val())
+        });
+        assert!(has_completed_final, "Event topic 'completed' should be published on trade completion");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz-style tests — numeric arithmetic on stroop amounts and fill counters
+// ---------------------------------------------------------------------------
+//
+// This workspace has no fuzzing harness set up (no cargo-fuzz target, no
+// proptest/quickcheck dependency), and adding an external crate here isn't
+// something this change can verify resolves without network access to
+// crates.io and a Cargo.lock update. Instead, this uses a small deterministic
+// PRNG (xorshift64, no new dependency) to exercise deposit_to_escrow and
+// cancel_and_refund across many randomised stroop amounts, fill splits, and
+// fill counts, asserting the arithmetic invariants around `filled_amount`
+// and the fill counter hold for every generated case rather than just the
+// handful of fixed values the existing unit tests use. Each test seeds its
+// PRNG with a fixed constant so a failure is reproducible.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::{Client as TokenClient, StellarAssetClient},
+        vec, Address, Env,
+    };
+
+    /// Minimal deterministic PRNG (xorshift64).
+    struct Xorshift64(u64);
+
+    impl Xorshift64 {
+        fn new(seed: u64) -> Self {
+            // xorshift64 requires a non-zero state.
+            Xorshift64(if seed == 0 { 0x9E3779B97F4A7C15 } else { seed })
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        /// Returns a value in the inclusive range [min, max].
+        fn range_i128(&mut self, min: i128, max: i128) -> i128 {
+            debug_assert!(max >= min);
+            let span = (max - min + 1) as u128;
+            min + (self.next_u64() as u128 % span) as i128
+        }
     }
 
-    #[test]
-    #[should_panic(expected = "ContractPaused")]
-    fn test_cancel_and_refund_blocked_when_paused() {
-        let (env, client, _admin, seller, buyer, token) = setup();
-        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
-
-        let trade_id = client.create_listing(
-            &seller,
-            &token,
-            &500_0000000i128,
-            &symbol_short!("AIRTIME"),
-            &(1_000_000 + 86_400),
-        );
-        client.deposit_to_escrow(&buyer, &trade_id);
-
-        // Advance past expiry
-        env.ledger().with_mut(|l| l.timestamp = 1_000_000 + 86_401);
-
-        client.pause();
-
-        client.cancel_and_refund(&buyer, &trade_id);
-    }
-
-    #[test]
-    #[should_panic(expected = "ContractPaused")]
-    fn test_flag_dispute_blocked_when_paused() {
-        let (env, client, _admin, seller, buyer, token) = setup();
-        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
-
-        let trade_id = client.create_listing(
-            &seller,
-            &token,
-            &500_0000000i128,
-            &symbol_short!("AIRTIME"),
-            &(1_000_000 + 86_400),
-        );
-        client.deposit_to_escrow(&buyer, &trade_id);
-
-        client.pause();
-
-        client.flag_dispute(&buyer, &trade_id);
-    }
-
-    #[test]
-    fn test_read_only_views_not_blocked_when_paused() {
-        let (env, client, _admin, seller, _buyer, token) = setup();
-        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
-
-        let trade_id = client.create_listing(
-            &seller,
-            &token,
-            &500_0000000i128,
-            &symbol_short!("AIRTIME"),
-            &(1_000_000 + 86_400),
-        );
-
-        client.pause();
-
-        // These should all succeed even while paused
-        let trade = client.get_trade(&trade_id);
-        assert_eq!(trade.id, trade_id);
-
-        let count = client.trade_count();
-        assert_eq!(count, 1);
-
-        let admin = client.get_admin();
-        assert!(!admin.to_string().is_empty());
-
-        assert!(client.is_paused());
-    }
-
-    #[test]
-    fn test_operations_resume_after_unpause() {
-        let (env, client, _admin, seller, buyer, token) = setup();
-        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
-
-        // Pause and then unpause
-        client.pause();
-        client.unpause();
-
-        // Should be able to create a listing again
-        let trade_id = client.create_listing(
-            &seller,
-            &token,
-            &500_0000000i128,
-            &symbol_short!("AIRTIME"),
-            &(1_000_000 + 86_400),
-        );
-
-        // And deposit
-        client.deposit_to_escrow(&buyer, &trade_id);
-
-        let trade = client.get_trade(&trade_id);
-        assert_eq!(trade.status, TradeStatus::Locked);
-    }
-
-    #[test]
-    #[should_panic(expected = "not initialised")]
-    fn test_pause_fails_if_not_initialised() {
+    fn setup() -> (
+        Env,
+        EscrowContractClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
 
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
 
-        // Calling pause without initializing should panic
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_id.address();
+
+        let allowed_tokens = vec![&env, token_address.clone()];
+        client.initialize(&admin, &allowed_tokens);
+
+        (env, client, admin, seller, token_address)
+    }
+
+    /// Fuzzes deposit_to_escrow with random total amounts and random
+    /// multi-buyer partial fills (stroop amounts), asserting that
+    /// `filled_amount` never exceeds `total_amount`, that it always equals
+    /// the running sum of accepted fills, and that any attempt to fill more
+    /// than what remains is rejected with InsufficientFunds — never a panic
+    /// or a silently wrapped value.
+    #[test]
+    fn fuzz_deposit_to_escrow_never_exceeds_total() {
+        let mut rng = Xorshift64::new(0xC0FFEE);
+
+        for iteration in 0..200u32 {
+            let (env, client, _admin, seller, token) = setup();
+            env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+            // Random total amount: 1 stroop up to ~10,000 XLM in stroops.
+            let total_amount = rng.range_i128(1, 1_000_000_000_000i128);
+
+            let trade_id = client.create_listing(
+                &seller,
+                &token,
+                &total_amount,
+                &symbol_short!("AIRTIME"),
+                &(1_000_000 + 86_400),
+            );
+
+            let sac = StellarAssetClient::new(&env, &token);
+            let mut running_filled: i128 = 0;
+
+            // A random number of partial fills, each sized to stay within
+            // what remains — exercises the running-sum bookkeeping without
+            // ever expecting InsufficientFunds along this path.
+            let fill_count = 1 + (rng.next_u64() % 5) as u32;
+            for _ in 0..fill_count {
+                let remaining = total_amount - running_filled;
+                if remaining <= 0 {
+                    break;
+                }
+                let fill_amount = rng.range_i128(1, remaining);
+
+                let buyer = Address::generate(&env);
+                sac.mint(&buyer, &fill_amount);
+                client.deposit_to_escrow(&buyer, &trade_id, &fill_amount);
+
+                running_filled += fill_amount;
+
+                let trade = client.get_trade(&trade_id);
+                assert!(
+                    trade.filled_amount <= trade.total_amount,
+                    "iteration {iteration}: filled_amount {} exceeded total_amount {}",
+                    trade.filled_amount,
+                    trade.total_amount
+                );
+                assert_eq!(trade.filled_amount, running_filled);
+            }
+
+            // Whatever is left over must reject an over-fill with a typed
+            // error rather than panicking or wrapping.
+            let remaining = total_amount - running_filled;
+            if remaining < total_amount {
+                let overfill = remaining + rng.range_i128(1, 10_000_000_000_000i128);
+                let buyer = Address::generate(&env);
+                sac.mint(&buyer, &overfill);
+                let result = client.try_deposit_to_escrow(&buyer, &trade_id, &overfill);
+                assert_eq!(result, Err(Ok(ContractError::InsufficientFunds)));
+            }
+
+            let final_trade = client.get_trade(&trade_id);
+            assert_eq!(final_trade.filled_amount, running_filled);
+        }
+    }
+
+    /// Fuzzes cancel_and_refund's fill-counter walk (the underflow this file
+    /// now guards with `checked_sub` — see cancel_and_refund) across random
+    /// total amounts and random two-way fill splits, asserting
+    /// `filled_amount` always settles back to exactly zero after a full
+    /// admin refund, with no panic and no negative/overflowed intermediate
+    /// value.
+    #[test]
+    fn fuzz_cancel_and_refund_settles_to_zero() {
+        let mut rng = Xorshift64::new(0xBADF00D);
+
+        for iteration in 0..100u32 {
+            let (env, client, admin, seller, token) = setup();
+            env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+            let total_amount = rng.range_i128(3, 900_000_000_000i128);
+            let trade_id = client.create_listing(
+                &seller,
+                &token,
+                &total_amount,
+                &symbol_short!("DATA"),
+                &(1_000_000 + 86_400),
+            );
+
+            let sac = StellarAssetClient::new(&env, &token);
+            let split = rng.range_i128(1, total_amount - 1);
+
+            for amount in [split, total_amount - split] {
+                let buyer = Address::generate(&env);
+                sac.mint(&buyer, &amount);
+                client.deposit_to_escrow(&buyer, &trade_id, &amount);
+            }
+
+            // Admin can cancel_and_refund immediately regardless of expiry —
+            // this walks the full fill counter and exercises the
+            // checked_sub fix in one call, across many random splits.
+            client.cancel_and_refund(&admin, &trade_id);
+
+            let trade = client.get_trade(&trade_id);
+            assert_eq!(
+                trade.filled_amount, 0,
+                "iteration {iteration}: filled_amount did not settle to zero after full admin refund"
+            );
+            assert_eq!(trade.status, TradeStatus::Cancelled);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // emergency_withdraw tests (Issue #346)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_emergency_withdraw_success_after_timelock() {
+        let (env, client, _admin, _seller, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let sac = StellarAssetClient::new(&env, &token);
+        let contract_addr = client.address.clone();
+        sac.mint(&contract_addr, &10_000_000_000i128);
+
         client.pause();
+
+        // Advance ledger time past 72 hours
+        env.ledger()
+            .with_mut(|l| l.timestamp = 1_000_000 + EMERGENCY_TIMELOCK_SECS + 1);
+
+        let recipient = Address::generate(&env);
+        let token_client = TokenClient::new(&env, &token);
+        let initial_balance = token_client.balance(&recipient);
+
+        client.emergency_withdraw(&token, &recipient, &500_0000000i128);
+
+        assert_eq!(
+            token_client.balance(&recipient),
+            initial_balance + 500_0000000i128
+        );
+    }
+
+    #[test]
+    fn test_emergency_withdraw_fails_before_timelock() {
+        let (env, client, _admin, _seller, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let sac = StellarAssetClient::new(&env, &token);
+        sac.mint(&client.address, &10_000_000_000i128);
+
+        client.pause();
+
+        // Only 1 hour passed
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000 + 3600);
+
+        let recipient = Address::generate(&env);
+        let result = client.try_emergency_withdraw(&token, &recipient, &500_0000000i128);
+        assert_eq!(result, Err(Ok(ContractError::TimelockNotExpired)));
+    }
+
+    #[test]
+    fn test_emergency_withdraw_fails_when_not_paused() {
+        let (env, client, _admin, _seller, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let sac = StellarAssetClient::new(&env, &token);
+        sac.mint(&client.address, &10_000_000_000i128);
+
+        let recipient = Address::generate(&env);
+        let result = client.try_emergency_withdraw(&token, &recipient, &500_0000000i128);
+        assert_eq!(result, Err(Ok(ContractError::WrongStatus)));
+    }
+
+    // -----------------------------------------------------------------------
+    // flag_dispute status restriction (#240)
+    // -----------------------------------------------------------------------
+
+    fn partially_filled_trade(
+        env: &Env,
+        client: &EscrowContractClient<'static>,
+        seller: &Address,
+        buyer: &Address,
+        token: &Address,
+    ) -> u64 {
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        let trade_id = client.create_listing(
+            seller,
+            token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+        client.deposit_to_escrow(buyer, &trade_id, &1i128);
+        assert_eq!(client.get_trade(&trade_id).status, TradeStatus::PartiallyFilled);
+        trade_id
+    }
+
+    #[test]
+    fn test_err_buyer_cannot_dispute_partially_filled_trade() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        let trade_id = partially_filled_trade(&env, &client, &seller, &buyer, &token);
+
+        let result = client.try_flag_dispute(&buyer, &trade_id);
+        assert_eq!(result, Err(Ok(ContractError::WrongStatus)));
+        assert_eq!(client.get_trade(&trade_id).status, TradeStatus::PartiallyFilled);
+    }
+
+    #[test]
+    fn test_err_seller_cannot_dispute_partially_filled_trade() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        let trade_id = partially_filled_trade(&env, &client, &seller, &buyer, &token);
+
+        let result = client.try_flag_dispute(&seller, &trade_id);
+        assert_eq!(result, Err(Ok(ContractError::WrongStatus)));
+    }
+
+    #[test]
+    fn test_err_cannot_dispute_open_trade() {
+        let (env, client, _admin, seller, _buyer, token) = setup();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        let trade_id = client.create_listing(
+            &seller,
+            &token,
+            &500_0000000i128,
+            &symbol_short!("AIRTIME"),
+            &(1_000_000 + 86_400),
+        );
+
+        let result = client.try_flag_dispute(&seller, &trade_id);
+        assert_eq!(result, Err(Ok(ContractError::WrongStatus)));
+    }
+
+    #[test]
+    fn test_dispute_allowed_once_partial_fill_is_locked() {
+        let (env, client, _admin, seller, buyer, token) = setup();
+        let trade_id = partially_filled_trade(&env, &client, &seller, &buyer, &token);
+
+        client.deposit_to_escrow(&buyer, &trade_id, &(500_0000000i128 - 1));
+        assert_eq!(client.get_trade(&trade_id).status, TradeStatus::Locked);
+
+        client.flag_dispute(&buyer, &trade_id);
+        assert_eq!(client.get_trade(&trade_id).status, TradeStatus::Disputed);
     }
 }

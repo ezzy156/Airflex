@@ -1,46 +1,62 @@
 /**
  * admin.ts — Admin-only API routes.
  *
- * All routes require a valid Bearer JWT. In the MVP, admin access is checked
- * by looking for a role = 'admin' column on the users row.  The authenticate
- * middleware validates the JWT; the requireAdmin middleware below validates
- * the role.
+ * All routes require a valid Bearer JWT (`authenticate`) and an admin role
+ * (`authorize("admin")`). The admin role is checked against the `role` column
+ * on the users row.
+ *
+ * Endpoints:
+ *   GET  /api/v1/admin/queues            — background job queue health
+ *   GET  /api/v1/admin/trades            — all trades (optional status filter + pagination)
+ *   POST /api/v1/admin/trades/:id/resolve— settle a disputed trade (RELEASE | REFUND)
+ *   GET  /api/v1/admin/users             — paginated users with balance + trade count
+ *   GET  /api/v1/admin/users/:phone      — single user profile + wallet + trade history
  */
 
-import { Router, Request, Response, NextFunction } from "express";
-import { authenticate, AuthenticatedRequest } from "../middleware/authenticate";
+import { Router } from "express";
+import { createHash } from "crypto";
+import { authenticate } from "../middleware/authenticate";
+import { authorize } from "../middleware/authorize";
+import { validate } from "../middleware/validate";
+import { normalizePhone, maskPhone } from "../utils/phone";
 import { QueueService } from "../jobs";
+import { SseEmitter } from "../services/sseEmitter";
 import pool from "../db";
+import { resolveDispute } from "../services/stellar";
+import {
+  resolveDisputeSchema,
+  paginationSchema,
+  type ResolveDisputeInput,
+} from "../schemas";
+import type { TradeOffer } from "../types/trade";
+import { FraudDetectionService } from "../services/fraudDetection";
 
 const router = Router();
 
-// ---------------------------------------------------------------------------
-// requireAdmin middleware
-// ---------------------------------------------------------------------------
+const ALLOWED_TRADE_STATUSES = [
+  "Active",
+  "Locked",
+  "Completed",
+  "Cancelled",
+  "Disputed",
+] as const;
 
 /**
- * Ensures the authenticated user has role = 'admin' in the users table.
- * Returns 403 if the user is not an admin.
+ * Columns admins are allowed to sort GET /admin/trades by (issue: sorting
+ * previously only supported created_at DESC). Whitelisted rather than taking
+ * the column name straight from the query string, since that string is
+ * interpolated into the ORDER BY clause and cannot be parameterised.
  */
-async function requireAdmin(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  const { sub: userId } = (req as AuthenticatedRequest).user;
+const ALLOWED_SORT_FIELDS = [
+  "created_at",
+  "updated_at",
+  "amount",
+  "status",
+  "expires_at",
+] as const;
+type SortField = (typeof ALLOWED_SORT_FIELDS)[number];
 
-  const { rows } = await pool.query<{ role: string }>(
-    `SELECT role FROM users WHERE id = $1 LIMIT 1`,
-    [userId]
-  );
-
-  if (!rows.length || rows[0]?.role !== "admin") {
-    res.status(403).json({ error: "Admin access required" });
-    return;
-  }
-
-  next();
-}
+const ALLOWED_SORT_ORDERS = ["asc", "desc"] as const;
 
 // ---------------------------------------------------------------------------
 // GET /api/v1/admin/queues  (admin only)
@@ -48,24 +64,11 @@ async function requireAdmin(
 
 /**
  * Returns queue depths and recent failure counts for all background job queues.
- *
- * Response shape:
- * {
- *   queues: Array<{
- *     name: string
- *     waiting: number
- *     active: number
- *     completed: number
- *     failed: number
- *     delayed: number
- *     recentFailures: Array<{ jobId, data, failedReason, timestamp }>
- *   }>
- * }
  */
 router.get(
   "/queues",
   authenticate,
-  requireAdmin,
+  authorize("admin"),
   async (_req, res) => {
     const queues = QueueService.getStats();
     res.status(200).json({ queues });
@@ -73,19 +76,450 @@ router.get(
 );
 
 // ---------------------------------------------------------------------------
-// Stub endpoints — to be implemented in future issues
+// GET /api/v1/admin/trades  (admin only)
 // ---------------------------------------------------------------------------
 
-router.get("/users", authenticate, requireAdmin, (_req: Request, res: Response) => {
-  res.status(501).json({ error: "Not Implemented" });
-});
+/**
+ * Returns all trades with optional `?status=Disputed` filtering, pagination,
+ * and sorting.
+ *
+ * Sorting: `?sortBy=<field>&sortOrder=<asc|desc>`. `sortBy` defaults to
+ * `created_at` and `sortOrder` defaults to `desc` (the previous, hard-coded
+ * behaviour), but any field in ALLOWED_SORT_FIELDS may now be requested.
+ */
+router.get(
+  "/trades",
+  authenticate,
+  authorize("admin"),
+  async (req, res) => {
+    const parsed = paginationSchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "Invalid query parameters",
+        details: parsed.error.flatten().fieldErrors,
+      });
+      return;
+    }
 
-router.get("/trades", authenticate, requireAdmin, (_req: Request, res: Response) => {
-  res.status(501).json({ error: "Not Implemented" });
-});
+    const { page, limit } = parsed.data;
+    const offset = (page - 1) * limit;
 
-router.patch("/users/:id", authenticate, requireAdmin, (_req: Request, res: Response) => {
-  res.status(501).json({ error: "Not Implemented" });
-});
+    const rawStatus =
+      typeof req.query.status === "string" ? req.query.status : undefined;
+    const filterByStatus = rawStatus !== undefined;
+
+    if (
+      filterByStatus &&
+      !(ALLOWED_TRADE_STATUSES as readonly string[]).includes(rawStatus)
+    ) {
+      res.status(400).json({
+        error: `status must be one of: ${ALLOWED_TRADE_STATUSES.join(", ")}`,
+      });
+      return;
+    }
+
+    const rawSortBy =
+      typeof req.query.sortBy === "string" ? req.query.sortBy : "created_at";
+    if (!(ALLOWED_SORT_FIELDS as readonly string[]).includes(rawSortBy)) {
+      res.status(400).json({
+        error: `sortBy must be one of: ${ALLOWED_SORT_FIELDS.join(", ")}`,
+      });
+      return;
+    }
+    const sortBy = rawSortBy as SortField;
+
+    const rawSortOrder =
+      typeof req.query.sortOrder === "string"
+        ? req.query.sortOrder.toLowerCase()
+        : "desc";
+    if (!(ALLOWED_SORT_ORDERS as readonly string[]).includes(rawSortOrder)) {
+      res.status(400).json({
+        error: `sortOrder must be one of: ${ALLOWED_SORT_ORDERS.join(", ")}`,
+      });
+      return;
+    }
+    const sortOrder = rawSortOrder.toUpperCase() as "ASC" | "DESC";
+
+    const where = filterByStatus ? "WHERE status = $1" : "";
+    const dataParams: (string | number)[] = filterByStatus
+      ? [rawStatus!, limit, offset]
+      : [limit, offset];
+    const countParams: (string | number)[] = filterByStatus ? [rawStatus!] : [];
+    const limitIdx = dataParams.length - 1;
+    const offsetIdx = dataParams.length;
+
+    // sortBy/sortOrder come from a closed whitelist above, never from the raw
+    // query string, so interpolating them into ORDER BY is safe here.
+    const { rows: trades } = await pool.query<TradeOffer>(
+      `SELECT * FROM trade_offers
+       ${where}
+       ORDER BY ${sortBy} ${sortOrder}, created_at DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      dataParams
+    );
+
+    const { rows: countRows } = await pool.query<{ count: string }>(
+      `SELECT COUNT(*) FROM trade_offers ${where}`,
+      countParams
+    );
+
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+
+    res.status(200).json({
+      data: trades,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/admin/trades/:id/resolve  (admin only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Settles a disputed trade by calling `resolve_dispute` on the Soroban escrow
+ * contract and updating the trade status in PostgreSQL.
+ *
+ * Body: { resolution: "RELEASE" | "REFUND" }
+ *   - RELEASE → funds released to the seller; DB status becomes Completed.
+ *   - REFUND  → funds returned to the buyer;  DB status becomes Cancelled.
+ *
+ * If the on-chain contract call fails, the database update is rolled back and
+ * the endpoint responds with HTTP 502 and a descriptive error.
+ */
+router.post(
+  "/trades/:id/resolve",
+  authenticate,
+  authorize("admin"),
+  validate(resolveDisputeSchema),
+  async (req, res) => {
+    const { id } = req.params;
+    const { resolution } = req.body as ResolveDisputeInput;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const { rows: tradeRows } = await client.query<TradeOffer>(
+        `SELECT * FROM trade_offers WHERE id = $1 FOR UPDATE`,
+        [id]
+      );
+
+      if (!tradeRows.length) {
+        await client.query("ROLLBACK");
+        res.status(404).json({ error: "Trade not found" });
+        return;
+      }
+
+      const trade = tradeRows[0]!;
+
+      if (trade.status !== "Disputed") {
+        await client.query("ROLLBACK");
+        res.status(400).json({
+          error:
+            `Trade cannot be resolved in its current state (${trade.status}). ` +
+            "Only Disputed trades can be resolved.",
+        });
+        return;
+      }
+
+      if (!trade.contract_listing_id) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: "Trade has no associated on-chain listing ID" });
+        return;
+      }
+
+      let txHash: string;
+      try {
+        txHash = await resolveDispute({
+          contractTradeId: trade.contract_listing_id,
+          resolution,
+        });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        const message = err instanceof Error ? err.message : String(err);
+        res.status(502).json({
+          error: `Failed to resolve dispute on-chain: ${message}`,
+        });
+        return;
+      }
+
+      const newStatus = resolution === "RELEASE" ? "Completed" : "Cancelled";
+
+      const { rows: updated } = await client.query<TradeOffer>(
+        `UPDATE trade_offers
+         SET status = $1, updated_at = NOW()
+         WHERE id = $2
+         RETURNING *`,
+        [newStatus, id]
+      );
+
+      await client.query("COMMIT");
+
+      const participants = [trade.seller_id];
+      if (trade.buyer_id) participants.push(trade.buyer_id);
+
+      SseEmitter.emit([...new Set(participants)], {
+        type: "trade_resolved",
+        tradeId: id,
+        status: newStatus,
+        resolution,
+        txHash,
+        message:
+          resolution === "RELEASE"
+            ? "The dispute was resolved in favour of the seller."
+            : "The dispute was resolved in favour of the buyer.",
+      });
+
+      res.status(200).json({ data: updated[0], txHash });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/users  (admin only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a paginated list of users with their ledger balance, trade count,
+ * and registration date.
+ *
+ * Performance (issue #256): the original query computed balance and trade
+ * count via correlated subqueries, executing one sub-select per user row —
+ * O(n) against `transactions` and `trade_offers` for a result set of n users.
+ * At 1 000 users that is 2 000 sub-selects; at 10 000 users it causes timeouts.
+ *
+ * The fix aggregates both metrics in a single pass each using grouped
+ * subqueries joined with LEFT JOIN.  The planner can hash- or merge-join the
+ * pre-aggregated subqueries against `users` in one scan, reducing total I/O
+ * from O(n) correlated lookups to O(1) sequential scans regardless of page size.
+ * `transactions(user_id)` is indexed by migration 010 (added alongside this
+ * change) so the aggregation scan uses the index rather than a full table scan.
+ */
+router.get(
+  "/users",
+  authenticate,
+  authorize("admin"),
+  async (req, res) => {
+    const parsed = paginationSchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "Invalid query parameters",
+        details: parsed.error.flatten().fieldErrors,
+      });
+      return;
+    }
+
+    const { page, limit } = parsed.data;
+    const offset = (page - 1) * limit;
+
+    const { rows: users } = await pool.query<{
+      id: string;
+      phone: string;
+      registrationDate: string;
+      balance: number;
+      tradeCount: number;
+    }>(
+      `SELECT
+         u.id,
+         u.phone,
+         u.created_at AS "registrationDate",
+         COALESCE(tx_agg.net_balance, 0)::float8          AS balance,
+         COALESCE(tr_agg.trade_count, 0)::int             AS "tradeCount"
+       FROM users u
+       LEFT JOIN (
+         SELECT
+           user_id,
+           SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END) AS net_balance
+         FROM transactions
+         GROUP BY user_id
+       ) tx_agg ON tx_agg.user_id = u.id
+       LEFT JOIN (
+         SELECT participant_id, COUNT(*) AS trade_count
+         FROM (
+           SELECT seller_id AS participant_id FROM trade_offers WHERE seller_id IS NOT NULL
+           UNION ALL
+           SELECT buyer_id  AS participant_id FROM trade_offers WHERE buyer_id  IS NOT NULL
+         ) participation
+         GROUP BY participant_id
+       ) tr_agg ON tr_agg.participant_id = u.id
+       ORDER BY u.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+
+    const { rows: countRows } = await pool.query<{ count: string }>(
+      `SELECT COUNT(*) FROM users`
+    );
+
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+
+    res.status(200).json({
+      data: users,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/users/:phone  (admin only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a single user's full profile, wallet balance, and trade history by
+ * phone number.
+ */
+router.get(
+  "/users/:phone",
+  authenticate,
+  authorize("admin"),
+  async (req, res) => {
+    const { phone } = req.params;
+    const normalizedPhone = normalizePhone(phone);
+
+    const { rows: userRows } = await pool.query<{
+      id: string;
+      phone: string;
+      role: string;
+      created_at: string;
+      stellar_public_key: string | null;
+      balance: number;
+    }>(
+      `SELECT
+         u.id,
+         u.phone,
+         u.role,
+         u.created_at,
+         u.stellar_public_key,
+         COALESCE((
+           SELECT SUM(CASE WHEN t.direction = 'credit' THEN t.amount ELSE -t.amount END)
+           FROM transactions t
+           WHERE t.user_id = u.id
+         ), 0)::float8 AS balance
+       FROM users u
+       WHERE u.phone = $1
+       LIMIT 1`,
+      [normalizedPhone]
+    );
+
+    if (!userRows.length) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    const user = userRows[0]!;
+
+    const { rows: tradeHistory } = await pool.query<TradeOffer>(
+      `SELECT * FROM trade_offers
+       WHERE seller_id = $1 OR buyer_id = $1
+       ORDER BY created_at DESC`,
+      [user.id]
+    );
+
+    const phoneHash = createHash("sha256")
+      .update(user.phone)
+      .digest("hex")
+      .slice(0, 8);
+
+    res.status(200).json({
+      data: {
+        id: user.id,
+        maskedPhone: maskPhone(user.phone),
+        phoneHash,
+        role: user.role,
+        registrationDate: user.created_at,
+        stellarPublicKey: user.stellar_public_key,
+        balance: user.balance,
+        tradeCount: tradeHistory.length,
+        tradeHistory,
+      },
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/flagged-accounts  (admin only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns accounts flagged for velocity violations (> 3 violations in past 24h).
+ */
+router.get(
+  "/flagged-accounts",
+  authenticate,
+  authorize("admin"),
+  async (_req, res) => {
+    const flagged = await FraudDetectionService.getFlaggedAccounts();
+    res.status(200).json({ flaggedAccounts: flagged });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Webhook dead-letter inspection (#118)
+// ---------------------------------------------------------------------------
+
+router.get(
+  "/webhooks",
+  authenticate,
+  authorize("admin"),
+  async (_req, res) => {
+    const { rows } = await pool.query(
+      `SELECT id, provider, event_type, payload, status, processed_at, created_at
+       FROM webhook_events
+       WHERE status = 'failed'
+       ORDER BY created_at DESC
+       LIMIT 100`
+    );
+    res.status(200).json({ events: rows });
+  }
+);
+
+router.post(
+  "/webhooks/:id/replay",
+  authenticate,
+  authorize("admin"),
+  async (req, res) => {
+    const id = req.params["id"];
+
+    const { rows } = await pool.query<{ id: string; status: string }>(
+      `SELECT id, status FROM webhook_events WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+
+    if (!rows.length) {
+      res.status(404).json({ error: "Webhook event not found" });
+      return;
+    }
+
+    if (rows[0]!.status !== "failed") {
+      res.status(409).json({ error: "Only failed webhook events can be replayed" });
+      return;
+    }
+
+    await pool.query(
+      `UPDATE webhook_events SET status = 'pending', processed_at = NULL WHERE id = $1`,
+      [id]
+    );
+
+    await QueueService.enqueue("process-paystack-webhook", { webhookEventId: id });
+
+    res.status(202).json({ message: "Webhook re-enqueued for processing" });
+  }
+);
 
 export default router;

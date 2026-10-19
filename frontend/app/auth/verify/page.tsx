@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useEffect, useRef, type FormEvent } from "react";
+import { postAuthDestination, readReturnTo } from "../../lib/returnTo";
+import { useTranslations } from "next-intl";
 import { saveToken, saveUser } from "../../lib/auth";
 
 // ---------------------------------------------------------------------------
@@ -12,16 +14,6 @@ interface VerifyResponse {
   user?: { id: string; phone: string; stellarPublicKey: string };
   error?: string;
   details?: Record<string, string[]>;
-}
-
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
-function validateOtp(value: string): string | null {
-  if (!value.trim()) return "OTP is required.";
-  if (!/^\d{6}$/.test(value.trim())) return "OTP must be exactly 6 digits.";
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +58,8 @@ function useResendCooldown() {
 // ---------------------------------------------------------------------------
 
 export default function VerifyPage() {
+  const t = useTranslations("Auth");
+
   const [phone, setPhone]                   = useState("");
   const [otp, setOtp]                       = useState("");
   const [otpError, setOtpError]             = useState<string | null>(null);
@@ -78,11 +72,20 @@ export default function VerifyPage() {
 
   const apiUrl = process.env["NEXT_PUBLIC_API_URL"] ?? "http://localhost:3001";
 
+  const [returnTo, setReturnTo] = useState<string | null>(null);
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const p = params.get("phone");
     if (p) setPhone(decodeURIComponent(p));
+    setReturnTo(readReturnTo());
   }, []);
+
+  function validateOtp(value: string): string | null {
+    if (!value.trim()) return t("otpRequired");
+    if (!/^\d{6}$/.test(value.trim())) return t("otpInvalid");
+    return null;
+  }
 
   // ---------------------------------------------------------------------------
   // Verify OTP
@@ -100,7 +103,7 @@ export default function VerifyPage() {
     setOtpError(null);
 
     if (!phone) {
-      setServerError("Phone number is missing. Please go back to the sign-up page.");
+      setServerError(t("phoneMissing"));
       return;
     }
 
@@ -119,25 +122,25 @@ export default function VerifyPage() {
         const detail = data.details
           ? Object.values(data.details).flat()[0]
           : data.error;
-        setServerError(detail ?? "Verification failed. Please try again.");
+        setServerError(detail ?? t("verificationFailed"));
         return;
       }
 
       if (!data.token || !data.user) {
-        setServerError("Unexpected server response. Please try again.");
+        setServerError(t("unexpectedResponse"));
         return;
       }
 
       saveToken(data.token);
       saveUser(data.user);
 
-      setSuccessMessage("Verified! Redirecting to your dashboard…");
+      setSuccessMessage(t("verified"));
 
       setTimeout(() => {
-        window.location.href = "/";
+        window.location.href = postAuthDestination(returnTo);
       }, 1200);
     } catch {
-      setServerError("Network error. Check your connection and try again.");
+      setServerError(t("networkError"));
     } finally {
       setLoading(false);
     }
@@ -149,7 +152,7 @@ export default function VerifyPage() {
   async function handleResend() {
     if (cooldown > 0 || resending) return;
     if (!phone) {
-      setServerError("Phone number is missing. Please go back to the sign-up page.");
+      setServerError(t("phoneMissing"));
       return;
     }
 
@@ -165,15 +168,15 @@ export default function VerifyPage() {
 
       if (!res.ok) {
         const data = (await res.json()) as { error?: string };
-        setServerError(data.error ?? "Failed to resend OTP. Please try again.");
+        setServerError(data.error ?? t("resendFailed"));
         return;
       }
 
-      setSuccessMessage("A new OTP has been sent to your phone.");
+      setSuccessMessage(t("newOtpSent"));
       startCooldown();
       setOtp("");
     } catch {
-      setServerError("Network error. Check your connection and try again.");
+      setServerError(t("networkError"));
     } finally {
       setResending(false);
     }
@@ -187,14 +190,14 @@ export default function VerifyPage() {
       {/* Heading */}
       <div className="mb-8">
         <h1 className="text-2xl font-extrabold text-gray-900 dark:text-gray-100">
-          Enter your OTP
+          {t("enterOtp")}
         </h1>
         <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">
-          We sent a 6-digit code to{" "}
+          {t("otpSentTo")}{" "}
           <span className="font-semibold text-gray-700 dark:text-gray-300">
-            {phone || "your phone"}
+            {phone || t("yourPhone")}
           </span>
-          . It expires in 10 minutes.
+          {t("otpExpiry")}
         </p>
       </div>
 
@@ -206,7 +209,7 @@ export default function VerifyPage() {
             htmlFor="otp"
             className="text-sm font-medium text-gray-700 dark:text-gray-300"
           >
-            Verification code
+            {t("verificationCode")}
           </label>
           <input
             id="otp"
@@ -275,17 +278,17 @@ export default function VerifyPage() {
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
               </svg>
-              Verifying…
+              {t("verifying")}
             </>
           ) : (
-            "Verify OTP"
+            t("verifyOtp")
           )}
         </button>
       </form>
 
       {/* Resend */}
       <div className="mt-6 text-center text-sm text-gray-500 dark:text-gray-400">
-        Didn&apos;t receive a code?{" "}
+        {t("didntReceive")}{" "}
         <button
           type="button"
           onClick={handleResend}
@@ -293,21 +296,21 @@ export default function VerifyPage() {
           className="font-semibold text-violet-600 hover:text-violet-700 focus:outline-none focus-visible:ring-1 focus-visible:ring-violet-500 rounded disabled:cursor-not-allowed disabled:text-gray-400 dark:text-violet-400 dark:hover:text-violet-300 dark:disabled:text-gray-600"
         >
           {resending
-            ? "Sending…"
+            ? t("sending")
             : cooldown > 0
-            ? `Resend in ${cooldown}s`
-            : "Resend OTP"}
+            ? t("resendIn", { seconds: cooldown })
+            : t("resendOtp")}
         </button>
       </div>
 
       {/* Back link */}
       <p className="mt-4 text-center text-sm text-gray-400 dark:text-gray-500">
-        Wrong number?{" "}
+        {t("wrongNumber")}{" "}
         <a
           href="/auth/signup"
           className="font-semibold text-violet-600 hover:text-violet-700 focus:outline-none focus-visible:ring-1 focus-visible:ring-violet-500 rounded dark:text-violet-400 dark:hover:text-violet-300"
         >
-          Go back
+          {t("goBack")}
         </a>
       </p>
     </>

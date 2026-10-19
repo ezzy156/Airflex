@@ -21,7 +21,11 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { usePathname } from "next/navigation";
-import { getToken, getUser, clearToken, isAuthenticated } from "../app/lib/auth";
+import { useTranslations } from "next-intl";
+import { getUser, clearToken, isAuthenticated } from "../app/lib/auth";
+import { apiFetch } from "../lib/apiFetch";
+import LanguageSwitcher from "./LanguageSwitcher";
+import ThemeToggle from "./ThemeToggle";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,9 +42,9 @@ interface WalletResponse {
 // ---------------------------------------------------------------------------
 
 const NAV_LINKS = [
-  { href: "/",         label: "Marketplace" },
-  { href: "/sell",     label: "Sell"        },
-  { href: "/profile",  label: "Wallet"      },
+  { href: "/",         labelKey: "marketplace" },
+  { href: "/sell",     labelKey: "sell"        },
+  { href: "/wallet",   labelKey: "wallet"      },
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -110,57 +114,6 @@ function WalletIcon() {
 }
 
 // ---------------------------------------------------------------------------
-// ThemeToggle — inlined so Navbar has no sibling component dependency.
-// When the dark-mode branch is merged this can be replaced with the import.
-// ---------------------------------------------------------------------------
-
-function ThemeToggle() {
-  const [mounted, setMounted] = useState(false);
-  const [isDark, setIsDark] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-    setIsDark(document.documentElement.classList.contains("dark"));
-  }, []);
-
-  function toggle() {
-    const next = !isDark;
-    setIsDark(next);
-    if (next) {
-      document.documentElement.classList.add("dark");
-      localStorage.setItem("theme", "dark");
-    } else {
-      document.documentElement.classList.remove("dark");
-      localStorage.setItem("theme", "light");
-    }
-  }
-
-  if (!mounted) return <span className="h-9 w-9 inline-block" aria-hidden="true" />;
-
-  return (
-    <button
-      type="button"
-      onClick={toggle}
-      aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
-      className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
-    >
-      {isDark ? (
-        /* Sun — switch to light */
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="4" />
-          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
-        </svg>
-      ) : (
-        /* Moon — switch to dark */
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-        </svg>
-      )}
-    </button>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Masked phone helper
 // ---------------------------------------------------------------------------
 
@@ -177,6 +130,7 @@ function maskPhone(phone: string): string {
 
 export default function Navbar() {
   const pathname = usePathname();
+  const t = useTranslations("Nav");
 
   // ---- auth / user state --------------------------------------------------
   const [mounted, setMounted]         = useState(false);
@@ -192,8 +146,6 @@ export default function Navbar() {
   const drawerRef                     = useRef<HTMLDivElement>(null);
   const hamburgerRef                  = useRef<HTMLButtonElement>(null);
 
-  const apiUrl = process.env["NEXT_PUBLIC_API_URL"] ?? "http://localhost:3001";
-
   // ---- resolve auth on mount ----------------------------------------------
   useEffect(() => {
     setMounted(true);
@@ -206,14 +158,8 @@ export default function Navbar() {
 
   // ---- fetch wallet balance when authenticated ----------------------------
   const fetchBalance = useCallback(() => {
-    const token = getToken();
-    if (!token) return;
-
     setBalanceLoading(true);
-    fetch(`${apiUrl}/api/v1/wallet`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-      .then((r) => r.json() as Promise<WalletResponse>)
+    apiFetch<WalletResponse>("/api/v1/wallet")
       .then((data) => {
         if (data.balance) {
           // Format to 2 dp and append asset symbol
@@ -223,7 +169,7 @@ export default function Navbar() {
       })
       .catch(() => {/* silent — balance is non-critical */})
       .finally(() => setBalanceLoading(false));
-  }, [apiUrl]);
+  }, []);
 
   useEffect(() => {
     if (mounted && authed) fetchBalance();
@@ -274,13 +220,13 @@ export default function Navbar() {
 
   // ---- shared link classes ------------------------------------------------
   const desktopLinkBase =
-    "text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 rounded-lg px-2 py-1";
-  const desktopLinkActive  = "text-violet-700 dark:text-violet-400";
-  const desktopLinkDefault = "text-gray-600 hover:text-violet-700 dark:text-gray-400 dark:hover:text-violet-400";
+    "text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 rounded-lg px-2.5 py-1.5";
+  const desktopLinkActive  = "bg-violet-50 text-violet-700 font-semibold dark:bg-violet-900/40 dark:text-violet-300";
+  const desktopLinkDefault = "text-gray-600 hover:bg-gray-50 hover:text-violet-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-violet-400";
 
   const drawerLinkBase =
     "flex items-center rounded-xl px-4 py-3 text-base font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500";
-  const drawerLinkActive  = "bg-violet-50 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300";
+  const drawerLinkActive  = "bg-violet-50 text-violet-700 font-semibold dark:bg-violet-900/30 dark:text-violet-300";
   const drawerLinkDefault = "text-gray-700 hover:bg-gray-50 hover:text-violet-700 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-violet-400";
 
   // -------------------------------------------------------------------------
@@ -308,17 +254,17 @@ export default function Navbar() {
 
           {/* Desktop nav links — hidden on mobile */}
           <nav
-            aria-label="Primary"
+            aria-label={t("primary")}
             className="hidden md:flex items-center gap-1"
           >
-            {NAV_LINKS.map(({ href, label }) => (
+            {NAV_LINKS.map(({ href, labelKey }) => (
               <a
                 key={href}
                 href={href}
                 aria-current={isActive(href) ? "page" : undefined}
                 className={`${desktopLinkBase} ${isActive(href) ? desktopLinkActive : desktopLinkDefault}`}
               >
-                {label}
+                {t(labelKey)}
               </a>
             ))}
           </nav>
@@ -345,8 +291,13 @@ export default function Navbar() {
                   {/* Masked phone — links to profile */}
                   <a
                     href="/profile"
-                    className="hidden lg:flex items-center rounded-lg px-2 py-1.5 text-xs font-medium text-gray-500 transition-colors hover:text-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:text-gray-400 dark:hover:text-violet-400"
-                    aria-label="View your profile"
+                    aria-current={isActive("/profile") ? "page" : undefined}
+                    className={`hidden lg:flex items-center rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 ${
+                      isActive("/profile")
+                        ? "bg-violet-50 text-violet-700 font-semibold dark:bg-violet-900/40 dark:text-violet-300"
+                        : "text-gray-500 hover:bg-gray-50 hover:text-violet-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-violet-400"
+                    }`}
+                    aria-label={t("viewProfile")}
                   >
                     {maskedPhone}
                   </a>
@@ -357,7 +308,7 @@ export default function Navbar() {
                     onClick={handleLogout}
                     className="inline-flex items-center rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
                   >
-                    Log out
+                    {t("logOut")}
                   </button>
                 </div>
               ) : (
@@ -366,12 +317,13 @@ export default function Navbar() {
                   href="/auth/signup"
                   className="hidden md:inline-flex items-center rounded-xl bg-violet-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
                 >
-                  Sign In
+                  {t("signIn")}
                 </a>
               )
             )}
 
             {/* Theme toggle — always visible */}
+            <LanguageSwitcher />
             <ThemeToggle />
 
             {/* Hamburger — mobile only */}
@@ -381,7 +333,7 @@ export default function Navbar() {
               onClick={() => setDrawerOpen((o) => !o)}
               aria-expanded={drawerOpen}
               aria-controls="mobile-drawer"
-              aria-label={drawerOpen ? "Close menu" : "Open menu"}
+              aria-label={drawerOpen ? t("closeMenu") : t("openMenu")}
               className="inline-flex md:hidden h-9 w-9 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
             >
               {drawerOpen ? <CloseIcon /> : <HamburgerIcon />}
@@ -407,7 +359,7 @@ export default function Navbar() {
         ref={drawerRef}
         role="dialog"
         aria-modal="true"
-        aria-label="Navigation menu"
+        aria-label={t("navMenu")}
         className={`fixed inset-y-0 right-0 z-50 w-72 max-w-full transform bg-white shadow-2xl transition-transform duration-200 ease-in-out md:hidden dark:bg-gray-900 ${
           drawerOpen ? "translate-x-0" : "translate-x-full"
         }`}
@@ -427,7 +379,7 @@ export default function Navbar() {
           <button
             type="button"
             onClick={() => { setDrawerOpen(false); hamburgerRef.current?.focus(); }}
-            aria-label="Close menu"
+            aria-label={t("closeMenu")}
             className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:text-gray-400 dark:hover:bg-gray-800"
           >
             <CloseIcon />
@@ -435,15 +387,15 @@ export default function Navbar() {
         </div>
 
         {/* Drawer nav links */}
-        <nav aria-label="Mobile primary" className="flex flex-col gap-1 px-3 pt-4">
-          {NAV_LINKS.map(({ href, label }) => (
+        <nav aria-label={t("mobilePrimary")} className="flex flex-col gap-1 px-3 pt-4">
+          {NAV_LINKS.map(({ href, labelKey }) => (
             <a
               key={href}
               href={href}
               aria-current={isActive(href) ? "page" : undefined}
               className={`${drawerLinkBase} ${isActive(href) ? drawerLinkActive : drawerLinkDefault}`}
             >
-              {label}
+              {t(labelKey)}
             </a>
           ))}
         </nav>
@@ -457,9 +409,9 @@ export default function Navbar() {
                 <div className="flex items-center gap-2 rounded-xl border border-gray-100 bg-gray-50 px-4 py-3 dark:border-gray-700 dark:bg-gray-800">
                   <WalletIcon />
                   <div className="flex flex-col">
-                    <span className="text-xs text-gray-400 dark:text-gray-500">Balance</span>
+                    <span className="text-xs text-gray-400 dark:text-gray-500">{t("balance")}</span>
                     <span className="text-sm font-semibold text-gray-800 tabular-nums dark:text-gray-200">
-                      {balanceLoading ? "Loading…" : (balance ?? "—")}
+                      {balanceLoading ? t("loadingBalance") : (balance ?? "—")}
                     </span>
                   </div>
                 </div>
@@ -467,7 +419,12 @@ export default function Navbar() {
                 {/* Masked phone */}
                 <a
                   href="/profile"
-                  className="flex items-center gap-2 rounded-xl border border-gray-100 bg-gray-50 px-4 py-3 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700"
+                  aria-current={isActive("/profile") ? "page" : undefined}
+                  className={`flex items-center gap-2 rounded-xl border border-gray-100 bg-gray-50 px-4 py-3 text-sm font-medium transition-colors hover:bg-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-700 dark:bg-gray-800 ${
+                    isActive("/profile")
+                      ? "border-violet-500 text-violet-700 font-semibold dark:border-violet-500 dark:text-violet-300"
+                      : "text-gray-600 dark:text-gray-400 dark:hover:bg-gray-700"
+                  }`}
                 >
                   <span aria-hidden="true">👤</span>
                   {maskedPhone}
@@ -479,7 +436,7 @@ export default function Navbar() {
                   onClick={handleLogout}
                   className="flex w-full items-center justify-center rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
                 >
-                  Log out
+                  {t("logOut")}
                 </button>
               </div>
             ) : (
@@ -487,7 +444,7 @@ export default function Navbar() {
                 href="/auth/signup"
                 className="flex w-full items-center justify-center rounded-xl bg-violet-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
               >
-                Sign In
+                {t("signIn")}
               </a>
             )}
           </div>

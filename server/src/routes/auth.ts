@@ -1,22 +1,62 @@
 import { Router } from "express";
+
+import { rateLimitOtp } from "../middleware/rateLimitOtp";
+import { authenticate, AuthenticatedRequest } from "../middleware/authenticate";
+import {
+  isRecoveryLockedOut,
+  recordFailedRecoveryAttempt,
+  RECOVERY_WINDOW_MINUTES,
+} from "../middleware/rateLimitRecovery";
 import { v4 as uuidv4 } from "uuid";
-import { randomInt } from "crypto";
+import { createHash } from "crypto";
 import jwt from "jsonwebtoken";
 import pool from "../db";
+import { cache } from "../services/cache";
 import { generateAndFundWallet } from "../services/stellar";
 import { validate } from "../middleware/validate";
 import {
   requestOtpSchema,
   verifyOtpSchema,
+  recoverSchema,
+  changePhoneSchema,
   type RequestOtpInput,
   type VerifyOtpInput,
+  type RecoverInput,
+  type ChangePhoneInput,
 } from "../schemas";
 import { createReferralCode } from "../services/referrals";
+import {
+  generateRecoveryCodesForUser,
+  userHasRecoveryCodes,
+  countRemainingRecoveryCodes,
+  redeemRecoveryCode,
+} from "../services/recoveryCodes";
+import { provisionVirtualAccountForUser } from "../services/virtualAccount";
+import { generateDisplayHandle } from "../utils/displayHandle";
 
 const router = Router();
 
+/**
+ * Returns the JWT signing secret.
+ *
+ * assertEnvValid() is called at server startup (index.ts) and exits the
+ * process if JWT_SECRET is absent or too short. This getter is a second line
+ * of defence: it throws a descriptive error rather than letting jsonwebtoken
+ * receive `undefined` and throw a cryptic internal exception (issue #247).
+ */
+function getJwtSecret(): string {
+  const secret = process.env["JWT_SECRET"];
+  if (!secret) {
+    throw new Error(
+      "[auth] JWT_SECRET is not set. " +
+        "The server should have exited at startup — check validateEnv.ts."
+    );
+  }
+  return secret;
+}
+
 function newReferralCode(): string {
-  return createReferralCode(() => randomInt(0, 32) / 32);
+  return createReferralCode();
 }
 
 /** Send OTP via Termii SMS API */
@@ -99,16 +139,22 @@ async function verifyOtpWithTermii(
 
 router.post(
   "/request-otp",
+  // Validation first so a malformed phone is rejected before it is charged
+  // against that number's quota (Issue #7).
   validate(requestOtpSchema),
+  rateLimitOtp,
   async (req, res) => {
     const { phone, referralCode } = req.body as RequestOtpInput;
 
-    // Upsert user row — create if first time, leave existing data untouched
+    // Upsert user row — create if first time, leave existing data untouched.
+    // The display handle is derived from the generated id, so it is stable for
+    // the user and hides the UUID on public trade listings (issue #330).
+    const userId = uuidv4();
     await pool.query(
-      `INSERT INTO users (id, phone, referral_code)
-       VALUES ($1, $2, $3)
+      `INSERT INTO users (id, phone, referral_code, display_handle)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT (phone) DO NOTHING`,
-      [uuidv4(), phone, newReferralCode()]
+      [userId, phone, newReferralCode(), generateDisplayHandle(userId)]
     );
 
     if (referralCode) {
@@ -149,8 +195,9 @@ router.post(
       otp_pin_id: string | null;
       otp_expires_at: string | null;
       stellar_public_key: string | null;
+      token_version: number;
     }>(
-      `SELECT u.id, u.otp_pin_id, u.otp_expires_at, w.stellar_public_key
+      `SELECT u.id, u.otp_pin_id, u.otp_expires_at, u.token_version, w.stellar_public_key
        FROM users u
        LEFT JOIN wallets w ON w.user_id = u.id
        WHERE u.phone = $1
@@ -162,18 +209,18 @@ router.post(
 
     if (!user) {
       // Return generic error — don't leak whether the phone exists
-      res.status(400).json({ error: "Invalid phone number or OTP" });
+      res.status(401).json({ error: "Invalid phone number or OTP" });
       return;
     }
 
     if (!user.otp_pin_id || !user.otp_expires_at) {
-      res.status(400).json({ error: "No pending OTP for this number. Request a new one." });
+      res.status(401).json({ error: "No pending OTP for this number. Request a new one." });
       return;
     }
 
     // Guard: OTP expired
     if (new Date(user.otp_expires_at) < new Date()) {
-      res.status(400).json({ error: "OTP has expired. Request a new one." });
+      res.status(401).json({ error: "OTP has expired. Request a new one." });
       return;
     }
 
@@ -188,7 +235,7 @@ router.post(
     }
 
     if (!verified) {
-      res.status(400).json({ error: "Invalid or expired OTP" });
+      res.status(401).json({ error: "Invalid or expired OTP" });
       return;
     }
 
@@ -234,10 +281,43 @@ router.post(
       }
     }
 
-    // Issue JWT — same payload shape the authenticate middleware expects
-    const secret = process.env["JWT_SECRET"]!;
+    // Issue 8 single-use recovery codes on first signup (issue #108). They are
+    // returned in plaintext exactly once and never stored or shown again.
+    let recoveryCodes: string[] = [];
+    try {
+      if (!(await userHasRecoveryCodes(user.id))) {
+        recoveryCodes = await generateRecoveryCodesForUser(user.id);
+      }
+    } catch (err) {
+      // Non-fatal for auth — log and continue. The user can still sign in;
+      // recovery codes can be re-issued through account support if needed.
+      console.error(
+        "[auth] Failed to issue recovery codes for user",
+        user.id,
+        "–",
+        (err as Error).message
+      );
+    }
+
+    // Provision a Paystack dedicated virtual account (non-fatal).
+    // Uses the phone number as display name until KYC provides a legal name.
+    // If inline creation fails the service enqueues a background retry job.
+    void provisionVirtualAccountForUser(user.id, phone).catch((err) => {
+      console.error(
+        "[auth] Virtual account provisioning error for user",
+        user.id,
+        "–",
+        (err as Error).message
+      );
+    });
+
+    // Issue JWT — same payload shape the authenticate middleware expects.
+    // `tokenVersion` lets this token be revoked before its 7-day expiry via
+    // POST /api/v1/auth/revoke (issue: previously there was no revocation
+    // mechanism at all).
+    const secret = getJwtSecret();
     const token = jwt.sign(
-      { sub: user.id, stellarPublicKey },
+      { sub: user.id, stellarPublicKey, tokenVersion: user.token_version },
       secret,
       { expiresIn: "7d" }
     );
@@ -245,6 +325,224 @@ router.post(
     res.status(200).json({
       token,
       user: { id: user.id, phone, stellarPublicKey },
+      // Only present on the very first signup — never on later logins.
+      ...(recoveryCodes.length > 0 ? { recoveryCodes } : {}),
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/auth/recover
+// ---------------------------------------------------------------------------
+//
+// 2FA recovery (issue #108): a user who lost their phone number redeems one of
+// their backup codes. A valid code is consumed (single-use) and exchanged for
+// a short-lived, one-time JWT scoped to `recovery`, which is then presented to
+// POST /api/v1/auth/recover/change-phone to register a new number.
+//
+// Brute-force protection: 5 failed attempts from the same IP within 1 hour
+// locks the IP out with HTTP 429.
+
+router.post(
+  "/recover",
+  validate(recoverSchema),
+  async (req, res) => {
+    const { recoveryCode } = req.body as RecoverInput;
+    const ip = req.ip ?? req.socket.remoteAddress ?? "unknown";
+
+    // Fail closed on the lockout check — a DB blip blocks recovery attempts
+    // for the duration rather than silently disabling the lockout.
+    let lockedOut: boolean;
+    try {
+      lockedOut = await isRecoveryLockedOut(ip);
+    } catch (err) {
+      console.error("[auth] Recovery lockout check failed:", (err as Error).message);
+      res.status(500).json({ error: "Internal server error" });
+      return;
+    }
+
+    if (lockedOut) {
+      res.status(429).json({
+        error: `Too many failed recovery attempts. Try again in ${RECOVERY_WINDOW_MINUTES} minute(s).`,
+      });
+      return;
+    }
+
+    let result: Awaited<ReturnType<typeof redeemRecoveryCode>>;
+    try {
+      result = await redeemRecoveryCode(recoveryCode);
+    } catch (err) {
+      console.error("[auth] Recovery redemption failed:", (err as Error).message);
+      res.status(500).json({ error: "Internal server error" });
+      return;
+    }
+
+    if (!result.ok) {
+      // Only failed attempts count towards the lockout.
+      try {
+        await recordFailedRecoveryAttempt(ip);
+      } catch (err) {
+        console.error("[auth] Failed to record recovery attempt:", (err as Error).message);
+      }
+      // Generic message — do not reveal whether the code exists or was used.
+      res.status(401).json({ error: "Invalid or already-used recovery code" });
+      return;
+    }
+
+    // One-time token: short TTL, scoped to recovery so it can never be used
+    // as a normal session token.
+    const secret = getJwtSecret();
+    const recoveryToken = jwt.sign(
+      { sub: result.userId, scope: "recovery", purpose: "change-phone" },
+      secret,
+      { expiresIn: "15m" }
+    );
+
+    res.status(200).json({
+      token: recoveryToken,
+      message: "Recovery code accepted. Use this token to register a new phone number.",
+      expiresIn: "15m",
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/auth/recover/change-phone
+// ---------------------------------------------------------------------------
+
+router.post(
+  "/recover/change-phone",
+  validate(changePhoneSchema),
+  async (req, res) => {
+    const { token, newPhone } = req.body as ChangePhoneInput;
+    const secret = getJwtSecret();
+
+    let payload: { sub?: string; scope?: string };
+    try {
+      payload = jwt.verify(token, secret) as { sub?: string; scope?: string };
+    } catch {
+      res.status(401).json({ error: "Recovery token is invalid or expired" });
+      return;
+    }
+
+    if (payload.scope !== "recovery" || !payload.sub) {
+      res.status(401).json({ error: "Recovery token is invalid or expired" });
+      return;
+    }
+
+    const tokenHash = createHash("sha256").update(token).digest("hex");
+    const isRevoked = await cache.get(`revoked_recovery_token:${tokenHash}`);
+    if (isRevoked) {
+      res.status(401).json({ error: "Recovery token is invalid or expired" });
+      return;
+    }
+
+    const userId = payload.sub;
+
+    // The new phone must not belong to another account.
+    const { rows: phoneRows } = await pool.query<{ id: string }>(
+      `SELECT id FROM users WHERE phone = $1 LIMIT 1`,
+      [newPhone]
+    );
+
+    if (phoneRows.length > 0 && phoneRows[0]!.id !== userId) {
+      res.status(409).json({ error: "That phone number is already registered" });
+      return;
+    }
+
+    // Re-verify the user still exists (they may have been deleted meanwhile).
+    const { rows: userRows } = await pool.query<{ id: string }>(
+      `SELECT id FROM users WHERE id = $1 LIMIT 1`,
+      [userId]
+    );
+
+    if (!userRows.length) {
+      res.status(404).json({ error: "Account not found" });
+      return;
+    }
+
+    // Update phone number and bump token version
+    await pool.query(
+      `UPDATE users SET phone = $1, token_version = token_version + 1, updated_at = NOW() WHERE id = $2`,
+      [newPhone, userId]
+    );
+
+    // Invalidate the recovery token immediately so it cannot be reused
+    await cache.set(`revoked_recovery_token:${tokenHash}`, "1", 15 * 60);
+
+    const sessionToken = jwt.sign(
+      { sub: userId, stellarPublicKey, tokenVersion },
+      getJwtSecret(),
+      { expiresIn: "7d" }
+    );
+
+    // Do NOT issue a session JWT yet — the user must complete OTP verification for the new number
+    res.status(200).json({
+      message: "Phone number updated. Please verify your new phone number with the OTP sent to complete sign-in.",
+      phone: newPhone,
+      requiresVerification: true,
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/auth/recovery-codes/status
+// ---------------------------------------------------------------------------
+
+/**
+ * Authenticated status check: how many backup codes remain unused. Never
+ * reveals the codes themselves.
+ */
+router.get(
+  "/recovery-codes/status",
+  authenticate,
+  async (req, res) => {
+    const { sub: userId } = (req as AuthenticatedRequest).user;
+
+    const remaining = await countRemainingRecoveryCodes(userId);
+
+    res.status(200).json({ data: { remaining } });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/auth/revoke
+// ---------------------------------------------------------------------------
+
+/**
+ * Revokes every session JWT currently outstanding for the authenticated
+ * user by bumping `users.token_version`. The token used to call this
+ * endpoint stops working immediately afterwards too, along with every other
+ * token issued before the bump — this is a "sign out everywhere" operation,
+ * not a way to revoke a single device.
+ *
+ * Previously there was no way to invalidate a session token before its
+ * natural 7-day expiry (e.g. after a lost phone or a suspected leak); this
+ * closes that gap. See middleware/authenticate.ts for the version check
+ * every authenticated request now performs.
+ */
+router.post(
+  "/revoke",
+  authenticate,
+  async (req, res) => {
+    const { sub: userId } = (req as AuthenticatedRequest).user;
+
+    const { rows } = await pool.query<{ token_version: number }>(
+      `UPDATE users
+       SET token_version = token_version + 1, updated_at = NOW()
+       WHERE id = $1
+       RETURNING token_version`,
+      [userId]
+    );
+
+    if (!rows.length) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    res.status(200).json({
+      message:
+        "All sessions have been revoked. You will need to sign in again on every device.",
     });
   }
 );

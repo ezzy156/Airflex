@@ -2,7 +2,7 @@
 
 AirFlex handles real user funds through Stellar-backed escrow contracts and
 Paystack payment integrations. We take security seriously and are committed to
-working with the security community to resolve vulnerabilities responsibly.
+working with the security community to resolve vulnerabilities responsibly
 
 ---
 
@@ -75,17 +75,6 @@ The following are **not** eligible for the responsible disclosure programme:
 - Theoretical vulnerabilities without a working proof-of-concept
 
 ---
-
-## Coordinated Disclosure
-
-AirFlex follows a **coordinated disclosure** model:
-
-1. You report the issue privately via the channels above.
-2. We triage, develop a fix, and deploy it.
-3. We publish a GitHub Security Advisory crediting you (with your permission)
-   after the fix is live.
-4. You are free to publish your own write-up 30 days after the fix is deployed,
-   or earlier by mutual agreement.
 
 We will **not** pursue legal action against researchers who:
 
